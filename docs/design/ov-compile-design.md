@@ -63,6 +63,46 @@ ov compile \
 Follow the loaded Skill's instructions to transform the provided source materials into the outputs required by the Skill.
 ```
 
+### 2.3 记忆整理模式（`--skill memory`）
+
+除了上面基于 VikingBot Skill 的 Wiki 整理，`ov compile` 还支持一种**记忆整理模式**：把 `--skill`
+设为哨兵值 `memory`，即可对 `--to` 指定的某个记忆类型目录做**就地整理**（去重、合并、拆分、原地精简），
+产物严格遵守该记忆类型的 schema。该模式完全在 OpenViking 进程内通过现有 memory 框架
+（`ExtractLoop` + `MemoryUpdater`）执行，**不经过 VikingBot**。
+
+```bash
+# 整理 entities 记忆（就地去重/合并/规范化）
+ov compile \
+  --to viking://user/<user_id>/memories/entities \
+  --skill memory \
+  --instruction "合并明显重复的实体，但不同实体不要合并；保留每个实体的独立事实"
+
+# 也可以整理其它记忆类型，例如 preferences
+ov compile \
+  --to viking://user/<user_id>/memories/preferences \
+  --skill memory
+```
+
+参数规则：
+
+| 参数 | 规则 |
+| --- | --- |
+| `--skill` | 固定值 `memory`（哨兵，不解析为真实 Skill）触发记忆整理模式 |
+| `--to` | 必填，必须是某个记忆类型目录（如 `.../memories/entities`），不能只到 `.../memories` 根 |
+| `--from` | 记忆模式下**不接受**；整理就地发生在 `--to` 空间内 |
+| `--instruction` | 可选，作为整理指令（软提示）喂给整理模型；用于点破"两条其实是同一实体需合并"这类模型无法自行判断的场景 |
+
+行为要点：
+
+- **单一类型**：只加载 `--to` 目录推断出的那一种记忆类型的 schema，整理收敛到这一种类型。
+- **就地整理**：`--from` 与 `--to` 是同一空间，不引入外部来源，因此不存在跨身份空间的串号问题；
+  空间（self 或某个 `peers/{peer_id}`）由 `--to` 的 URI 决定。
+- **保守合并**：默认只合并明显同一身份的记忆；模型无法从内容判断的合并（如"阿珍就是陈静娴"），
+  必须通过 `--instruction` 明确点破。
+- **异步任务**：与普通 compile 一致，命令返回一个 `cmp_` 前缀的 `task_id`，通过 `ov task status <task_id>`
+  查询结果。记忆模式的任务结果包含变化文件清单，字段沿用 `memory_diff.json` 的语义
+  （`adds` / `updates` / `deletes` 及对应 `total_*`，仅文件 URI，不含内容），并带上本次整理的 `trace_id`。
+
 ### 2.2 返回结果
 
 CLI 在任务创建后立即返回：
