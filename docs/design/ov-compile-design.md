@@ -63,6 +63,20 @@ ov compile \
 Follow the loaded Skill's instructions to transform the provided source materials into the outputs required by the Skill.
 ```
 
+### 2.2 返回结果
+
+CLI 在任务创建后立即返回：
+
+```text
+task_id: cmp_01...
+status: accepted
+to: viking://resources/团队知识库
+```
+
+CLI 不等待任务完成。用户通过 `ov task status <task_id>` 查询状态和结果，通过 `ov task cancel <task_id>` 取消任务。
+
+Task 结果中的 `created`、`updated` 和 `unchanged` 只统计 Agent 本次提交的页面；未被草稿触达的目标页面不计入 `unchanged`。`page_count` 等于三者之和，`link_count` 只统计最终正文中实际渲染出的 bundle 内 WikiLink。
+
 ### 2.3 记忆整理模式（`--skill memory`）
 
 除了上面基于 VikingBot Skill 的 Wiki 整理，`ov compile` 还支持一种**记忆整理模式**：把 `--skill`
@@ -102,20 +116,6 @@ ov compile \
 - **异步任务**：与普通 compile 一致，命令返回一个 `cmp_` 前缀的 `task_id`，通过 `ov task status <task_id>`
   查询结果。记忆模式的任务结果包含变化文件清单，字段沿用 `memory_diff.json` 的语义
   （`adds` / `updates` / `deletes` 及对应 `total_*`，仅文件 URI，不含内容），并带上本次整理的 `trace_id`。
-
-### 2.2 返回结果
-
-CLI 在任务创建后立即返回：
-
-```text
-task_id: cmp_01...
-status: accepted
-to: viking://resources/团队知识库
-```
-
-CLI 不等待任务完成。用户通过 `ov task status <task_id>` 查询状态和结果，通过 `ov task cancel <task_id>` 取消任务。
-
-Task 结果中的 `created`、`updated` 和 `unchanged` 只统计 Agent 本次提交的页面；未被草稿触达的目标页面不计入 `unchanged`。`page_count` 等于三者之和，`link_count` 只统计最终正文中实际渲染出的 bundle 内 WikiLink。
 
 ## 3. 架构
 

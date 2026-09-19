@@ -11,10 +11,11 @@ is involved.
 
 from __future__ import annotations
 
+import re
 from typing import Any, Dict, List, Optional
 
 from openviking.server.identity import RequestContext
-from openviking.session.memory.dataclass import MemoryFile, MemoryTypeSchema
+from openviking.session.memory.dataclass import MemoryTypeSchema
 from openviking.session.memory.memory_isolation_handler import MemoryIsolationHandler
 from openviking.session.memory.memory_type_registry import MemoryTypeRegistry
 from openviking.session.memory.merge_policy import MEMORY_MERGE_POLICY
@@ -23,23 +24,17 @@ from openviking.session.memory.session_extract_context_provider import (
 )
 from openviking.session.memory.tools import add_tool_call_pair_to_messages, get_tool
 from openviking.session.memory.utils.language import resolve_output_language_from_text
-from openviking.telemetry import tracer
-from openviking_cli.utils import get_logger
-
-logger = get_logger(__name__)
+from openviking_cli.exceptions import NotFoundError
+from openviking_cli.utils.config import get_openviking_config
 
 _RESERVED_NAMES = {".overview.md", ".abstract.md"}
+_LANGUAGE_SAMPLE_FILES = 3
+_LANGUAGE_SAMPLE_BYTES = 4096
+_MEMORY_FIELDS_START = re.compile(r"<!--\s*MEMORY_FIELDS\b")
 
 
 class ConsolidationExtractContextProvider(SessionExtractContextProvider):
-    """Reorganize existing memories of a single type within one isolation space.
-
-    The provider prefetches every non-reserved ``.md`` file discovered under the
-    schema directories that the isolation handler exposes (self and/or peer
-    spaces), then instructs the model to consolidate them in place. It reuses
-    ``SessionExtractContextProvider``'s read/search tooling and page-id tracking,
-    but carries no conversation messages.
-    """
+    """Reorganize one memory type using a recursive inventory and read/search tools."""
 
     include_tool_parts_in_conversation = False
     split_long_text_messages_for_extraction = False
@@ -61,10 +56,12 @@ class ConsolidationExtractContextProvider(SessionExtractContextProvider):
         self.target_directory = target_directory.rstrip("/") if target_directory else None
         self._registry = memory_registry
         self._instruction_text = (instruction or "").strip()
-        # Language is resolved lazily from prefetched content when not supplied.
-        self._output_language = output_language or "en"
-        self._language_resolved = output_language is not None
-        self.prefetched_uris: List[str] = []
+        self._output_language = resolve_output_language_from_text(
+            "", fallback_language=output_language or "en"
+        )
+        self._language_resolved = bool(
+            output_language or get_openviking_config().output_language_override.strip()
+        )
 
     # ── Schema scope: a single memory type inferred from --to ──
 
@@ -169,16 +166,6 @@ All memory content MUST be written in {output_language}.
             tool = MemoryLsTool()
         return await tool.execute(self.create_tool_context(), uri=directory, recursive=True)
 
-    async def _raw_ls(self, directory: str) -> List[Dict[str, Any]]:
-        if not self._viking_fs:
-            return []
-        try:
-            return await self._viking_fs.ls(directory, output="original", ctx=self._ctx) or []
-        except Exception as exc:
-            if not self._is_expected_read_not_found(exc):
-                tracer.info(f"Consolidation: failed to list {directory}: {exc}")
-            return []
-
     def _render_directories(self, schema: MemoryTypeSchema) -> List[str]:
         # Prefer the explicit canonical --to directory so listing does not depend
         # on ctx.user_id (which may be empty and collapse the URI).
@@ -188,44 +175,49 @@ All memory content MUST be written in {output_language}.
             return list(dict.fromkeys(self._isolation_handler.render_schema_directories(schema)))
         return []
 
-    async def _list_memory_files(self, directory: str) -> List[str]:
-        """List non-reserved ``.md`` files directly under ``directory``.
-
-        Retained as a helper for callers that want a flat file inventory; the
-        agentic prefetch itself only seeds a shallow ls and lets the model
-        explore. Not used on the primary path.
-        """
-        entries = await self._raw_ls(directory)
-        uris: List[str] = []
-        for entry in entries:
-            if not isinstance(entry, dict):
-                continue
-            if entry.get("isDir"):
-                continue
-            name = str(entry.get("name", ""))
-            uri = str(entry.get("uri", ""))
-            if not uri.endswith(".md"):
-                continue
-            if (
-                name in _RESERVED_NAMES
-                or uri.endswith("/.overview.md")
-                or uri.endswith("/.abstract.md")
-            ):
-                continue
-            uris.append(uri)
-        return uris
-
-    def _resolve_output_language(self) -> None:
+    async def prepare_extraction_messages(self) -> None:
         if self._language_resolved:
             return
-        texts: List[str] = []
-        for mf in self._read_file_contents.values():
-            if isinstance(mf, MemoryFile) and mf.content:
-                texts.append(mf.content)
-        if texts:
-            self._output_language = resolve_output_language_from_text(
-                "\n".join(texts), fallback_language="en"
+        config = get_openviking_config()
+        if config.output_language_override.strip():
+            self._output_language = resolve_output_language_from_text("", config=config)
+            self._language_resolved = True
+            return
+        schema = self.get_memory_schemas(self._ctx)[0]
+        samples: list[str] = []
+        sampled_uris: set[str] = set()
+        for directory in self._render_directories(schema):
+            if len(sampled_uris) >= _LANGUAGE_SAMPLE_FILES:
+                break
+            listing = await self._viking_fs.glob(
+                "**/*.md",
+                uri=directory,
+                node_limit=_LANGUAGE_SAMPLE_FILES - len(sampled_uris),
+                extra_fields=[],
+                ctx=self._ctx,
             )
+            for entry in listing["matches"]:
+                uri = entry["uri"]
+                if (
+                    entry.get("isDir")
+                    or uri.rsplit("/", 1)[-1] in _RESERVED_NAMES
+                    or uri in sampled_uris
+                ):
+                    continue
+                sampled_uris.add(uri)
+                try:
+                    # A language sample must not satisfy ExtractLoop's read-before-write guard.
+                    raw = await self._viking_fs.read(
+                        uri, size=_LANGUAGE_SAMPLE_BYTES, ctx=self._ctx
+                    )
+                except NotFoundError:
+                    continue
+                text = raw.decode("utf-8", errors="ignore")
+                # The byte cap can cut the metadata comment before its closing delimiter.
+                samples.append(_MEMORY_FIELDS_START.split(text, maxsplit=1)[0])
+        self._output_language = resolve_output_language_from_text(
+            "\n".join(samples), config=config, fallback_language="en"
+        )
         self._language_resolved = True
 
     def get_output_language(self) -> str:

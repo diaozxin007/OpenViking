@@ -20,6 +20,7 @@ from openviking.core.uri_validation import validate_request_viking_uri
 from openviking.server.identity import RequestContext
 from openviking.service.fs_service import FSService
 from openviking.service.task_tracker import TaskRecord, get_task_tracker
+from openviking.service.task_work_index import bind_task_context
 from openviking.session.memory.consolidation_context_provider import (
     ConsolidationExtractContextProvider,
     build_consolidation_isolation_handler,
@@ -160,6 +161,7 @@ class MemoryCompileRunner:
         ctx: RequestContext,
     ) -> None:
         tracker = get_task_tracker()
+        tracker.register_running_task(task_id)
         root_token = None
         if bind_root_observability_context is not None:
             root_attrs = create_root_span_attributes(
@@ -180,13 +182,14 @@ class MemoryCompileRunner:
                     user_id=ctx.user.user_id,
                     stage="consolidating",
                 )
-                result = await self._consolidate(
-                    target=target,
-                    memory_type=memory_type,
-                    peer_id=peer_id,
-                    instruction=instruction,
-                    ctx=ctx,
-                )
+                with bind_task_context(task_id, ctx.account_id, ctx.user.user_id):
+                    result = await self._consolidate(
+                        target=target,
+                        memory_type=memory_type,
+                        peer_id=peer_id,
+                        instruction=instruction,
+                        ctx=ctx,
+                    )
                 await tracker.complete(
                     task_id,
                     {"to": target, "skill": "memory", "trace_id": trace_id, **result},
@@ -194,7 +197,7 @@ class MemoryCompileRunner:
                     user_id=ctx.user.user_id,
                 )
         except asyncio.CancelledError:
-            raise
+            return
         except Exception as exc:  # noqa: BLE001 - surface any failure as task error
             tracer.error(f"Memory-mode compile failed: {exc}")
             await tracker.fail(
@@ -206,6 +209,7 @@ class MemoryCompileRunner:
         finally:
             if root_token is not None and reset_root_observability_context is not None:
                 reset_root_observability_context(root_token)
+            await tracker.unregister_running_task(task_id)
 
     async def _consolidate(
         self,
@@ -238,6 +242,7 @@ class MemoryCompileRunner:
         )
         isolation_handler.prepare_messages()
         provider._isolation_handler = isolation_handler
+        await provider.prepare_extraction_messages()
 
         orchestrator = ExtractLoop(
             vlm=vlm,
