@@ -2168,6 +2168,10 @@ async def acquire_memory_operation_lease(
     viking_fs: Any | None,
     ctx: RequestContext,
 ) -> Any | None:
+    # Materialize implicit URI changes only at the final apply boundary. Doing
+    # this before second-stage patch merging would present the same rename as
+    # both an update patch and a delete patch.
+    MemoryUpdater._materialize_uri_migrations(operations)
     lock_paths = _operation_lock_paths(operations, viking_fs, ctx)
     if not lock_paths:
         return None

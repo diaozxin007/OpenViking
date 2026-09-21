@@ -898,16 +898,6 @@ class ExtractLoop:
                 upsert_operations.append(resolved_op)
 
         delete_replacements: dict[str, str] = {}
-        for operation in upsert_operations:
-            old_file = operation.old_memory_file_content
-            if old_file is None or not old_file.uri or not operation.uris:
-                continue
-            target_uri = operation.uris[0]
-            if target_uri == old_file.uri:
-                continue
-            delete_file_contents.append(old_file)
-            delete_replacements[old_file.uri] = target_uri
-
         delete_ids = self._normalize_delete_ids(getattr(operations, "delete_ids", []) or [])
         for delete_id in delete_ids:
             if delete_id.delete_page_id is None or page_id_map is None:
