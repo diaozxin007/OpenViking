@@ -1202,12 +1202,15 @@ class TestMemoryUpdater:
         assert migrated.extra_fields["version"] == 3
 
     @pytest.mark.asyncio
-    async def test_apply_operations_rejects_occupied_rename_target_before_writes(self):
+    @pytest.mark.parametrize("target_content", ["occupied", ""])
+    async def test_apply_operations_rejects_occupied_rename_target_before_writes(
+        self, target_content
+    ):
         source_uri = "viking://user/u/memories/entities/person/阿珍.md"
         target_uri = "viking://user/u/memories/entities/person/陈静娴.md"
         old_file = MemoryFile(uri=source_uri, memory_type="entities", content="source")
         mock_viking_fs = MagicMock()
-        mock_viking_fs.read_file = AsyncMock(return_value="occupied")
+        mock_viking_fs.read_file = AsyncMock(return_value=target_content)
         updater = MemoryUpdater(registry=MagicMock())
         updater._get_viking_fs = MagicMock(return_value=mock_viking_fs)
         updater._apply_upsert = AsyncMock()

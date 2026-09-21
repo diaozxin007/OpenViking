@@ -1283,12 +1283,12 @@ class MemoryUpdater:
             old_content: Optional[MemoryFile] = None
             try:
                 content = await viking_fs.read_file(uri, ctx=ctx)
+                if is_uri_migration:
+                    raise ConflictError(
+                        f"Memory rename target already exists: {uri}",
+                        resource=uri,
+                    )
                 if content:
-                    if is_uri_migration:
-                        raise ConflictError(
-                            f"Memory rename target already exists: {uri}",
-                            resource=uri,
-                        )
                     old_content = MemoryFileUtils.read(content, uri=uri)
             except ConflictError:
                 raise
