@@ -1199,9 +1199,39 @@ class TestMemoryUpdater:
         source_uri = "viking://user/u/memories/entities/person/阿珍.md"
         target_uri = "viking://user/u/memories/entities/person/陈静娴.md"
         source_file = MemoryFile(uri=source_uri, memory_type="entities", content="source")
+        profile_uri = "viking://user/u/memories/profile.md"
+        source_file.links = [
+            {
+                "from_uri": source_uri,
+                "to_uri": profile_uri,
+                "link_type": "related_to",
+                "weight": 0.8,
+                "match_text": "source",
+                "description": "source link",
+            }
+        ]
         target_file = MemoryFile(uri=target_uri, memory_type="entities", content="merged")
+        profile_file = MemoryFile(
+            uri=profile_uri,
+            memory_type="profile",
+            content="profile",
+            backlinks=list(source_file.links),
+        )
+        store = {
+            source_uri: MemoryFileUtils.write(source_file),
+            target_uri: MemoryFileUtils.write(target_file),
+            profile_uri: MemoryFileUtils.write(profile_file),
+        }
         mock_viking_fs = MagicMock()
-        mock_viking_fs.read_file = AsyncMock(return_value="occupied")
+
+        async def read_file(uri, **kwargs):
+            return store[uri]
+
+        async def write_file(uri, content, **kwargs):
+            store[uri] = content
+
+        mock_viking_fs.read_file = AsyncMock(side_effect=read_file)
+        mock_viking_fs.write_file = AsyncMock(side_effect=write_file)
         updater = MemoryUpdater(registry=MagicMock())
         updater._get_viking_fs = MagicMock(return_value=mock_viking_fs)
         updater._apply_upsert = AsyncMock()
@@ -1226,8 +1256,13 @@ class TestMemoryUpdater:
         ctx = MagicMock()
         result = await updater.apply_operations(operations, ctx)
 
-        assert result.edited_uris == [target_uri]
+        assert result.edited_uris == [target_uri, profile_uri]
         assert result.deleted_uris == [source_uri]
+        target = MemoryFileUtils.read(store[target_uri], uri=target_uri)
+        assert target.links[0]["from_uri"] == target_uri
+        assert target.links[0]["to_uri"] == profile_uri
+        profile = MemoryFileUtils.read(store[profile_uri], uri=profile_uri)
+        assert profile.backlinks[0]["from_uri"] == target_uri
         updater._apply_upsert.assert_awaited_once()
         updater._apply_delete.assert_awaited_once_with(source_uri, ctx, lease_ref=None)
 

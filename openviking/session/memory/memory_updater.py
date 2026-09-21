@@ -1535,11 +1535,19 @@ class MemoryUpdater:
                     ].append(remapped)
 
         written_or_edited = set(result.written_uris + result.edited_uris)
+        implicit_migration_targets = {
+            operation.uris[0]
+            for operation in operations.upsert_operations
+            if self._is_uri_migration(operation) and len(operation.uris) == 1
+        }
         stale_uris = set(uri_remap)
         for uri, link_groups in inherited_by_uri.items():
             if uri in uri_remap:
                 continue
-            if uri in written_or_edited:
+            # Implicit renames copied and remapped the source links while
+            # writing the new file. Explicit merges update an existing target,
+            # so they still need the deleted source's relations folded in here.
+            if uri in implicit_migration_targets:
                 continue
             try:
                 content = await viking_fs.read_file(uri, ctx=ctx)
@@ -1574,7 +1582,8 @@ class MemoryUpdater:
                     ctx=ctx,
                     lease_ref=lease_ref,
                 )
-                result.add_edited(uri)
+                if uri not in written_or_edited:
+                    result.add_edited(uri)
             except (NotFoundError, FileNotFoundError) as e:
                 # Benign: a linked neighbor may have been deleted in the same
                 # batch. Link inheritance is best-effort, so warn and skip.
