@@ -870,11 +870,17 @@ class ExtractLoop:
                                 for field in schema.fields
                                 if field.merge_op == MergeOp.IMMUTABLE
                             }
-                            for field_name in immutable_fields:
-                                if ImmutableOp.is_set(old_content.extra_fields.get(field_name)):
-                                    resolved_op.memory_fields[field_name] = (
-                                        old_content.extra_fields[field_name]
-                                    )
+                            preserved_fields = set(immutable_fields)
+                            preserved_fields.update(schema.identity_fields(include_peer_id=False))
+                            for field_name in preserved_fields:
+                                old_value = old_content.extra_fields.get(field_name)
+                                if not ImmutableOp.is_set(old_value):
+                                    continue
+                                new_value = resolved_op.memory_fields.get(field_name)
+                                if field_name in immutable_fields or not ImmutableOp.is_set(
+                                    new_value
+                                ):
+                                    resolved_op.memory_fields[field_name] = old_value
                             target_uri = await self._updated_uri_for_existing_operation(
                                 resolved_op,
                                 schema=schema,
