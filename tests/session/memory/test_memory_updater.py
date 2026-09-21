@@ -1463,6 +1463,39 @@ class TestMemoryUpdater:
         updater._apply_delete.assert_not_awaited()
 
     @pytest.mark.asyncio
+    async def test_apply_operations_rejects_case_only_explicit_replacement(self):
+        source_uri = "viking://user/u/memories/entities/person/Alice.md"
+        target_uri = "viking://user/u/memories/entities/person/alice.md"
+        source = MemoryFile(uri=source_uri, memory_type="entities", content="source")
+        target = MemoryFile(uri=target_uri, memory_type="entities", content="target")
+        updater = MemoryUpdater(registry=MagicMock())
+        updater._get_viking_fs = MagicMock(return_value=MagicMock())
+        updater._apply_upsert = AsyncMock()
+        updater._apply_delete = AsyncMock()
+        updater._sync_resource_refs_for_result = AsyncMock()
+        updater._vectorize_memories = AsyncMock()
+        updater.generate_overview = AsyncMock()
+        operations = ResolvedOperations(
+            upsert_operations=[
+                ResolvedOperation(
+                    old_memory_file_content=target,
+                    memory_fields={"content": "merged"},
+                    memory_type="entities",
+                    uris=[target_uri],
+                )
+            ],
+            delete_file_contents=[source],
+            delete_replacements={source_uri: target_uri},
+            errors=[],
+        )
+
+        result = await updater.apply_operations(operations, MagicMock())
+
+        assert result.deleted_uris == []
+        assert any("Case-only" in str(error) for _uri, error in result.errors)
+        updater._apply_delete.assert_not_awaited()
+
+    @pytest.mark.asyncio
     async def test_apply_operations_keeps_source_when_link_migration_fails(self):
         source_uri = "viking://user/u/memories/entities/person/阿珍.md"
         target_uri = "viking://user/u/memories/entities/person/陈静娴.md"

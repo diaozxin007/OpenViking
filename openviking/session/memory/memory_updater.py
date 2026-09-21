@@ -1134,6 +1134,17 @@ class MemoryUpdater:
                 result.add_error(source_uri, error)
                 invalid_sources.add(source_uri)
                 continue
+            if _same_batch_delete_conflict_key(source_uri) == _same_batch_delete_conflict_key(
+                target_uri
+            ):
+                error = ConflictError(
+                    "Case-only memory replacement URIs are not portable; choose a distinct "
+                    f"target name: {source_uri} -> {target_uri}",
+                    resource=target_uri,
+                )
+                result.add_error(source_uri, error)
+                invalid_sources.add(source_uri)
+                continue
             if target_uri in successful_upsert_uris:
                 continue
             if target_uri in scheduled_delete_uris:
