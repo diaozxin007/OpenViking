@@ -1236,6 +1236,39 @@ class TestMemoryUpdater:
         updater._apply_delete.assert_not_awaited()
 
     @pytest.mark.asyncio
+    async def test_apply_operations_rejects_case_only_uri_rename(self):
+        source_uri = "viking://user/u/memories/entities/person/Alice.md"
+        target_uri = "viking://user/u/memories/entities/person/alice.md"
+        old_file = MemoryFile(uri=source_uri, memory_type="entities", content="source")
+        mock_viking_fs = MagicMock()
+        mock_viking_fs.read_file = AsyncMock()
+        updater = MemoryUpdater(registry=MagicMock())
+        updater._get_viking_fs = MagicMock(return_value=mock_viking_fs)
+        updater._apply_upsert = AsyncMock()
+        updater._apply_delete = AsyncMock()
+        operations = ResolvedOperations(
+            upsert_operations=[
+                ResolvedOperation(
+                    old_memory_file_content=old_file,
+                    memory_fields={"name": "alice"},
+                    memory_type="entities",
+                    uris=[target_uri],
+                )
+            ],
+            delete_file_contents=[],
+            errors=[],
+        )
+
+        result = await updater.apply_operations(operations, MagicMock())
+
+        assert len(result.errors) == 1
+        assert isinstance(result.errors[0][1], ConflictError)
+        assert "Case-only" in str(result.errors[0][1])
+        mock_viking_fs.read_file.assert_not_awaited()
+        updater._apply_upsert.assert_not_awaited()
+        updater._apply_delete.assert_not_awaited()
+
+    @pytest.mark.asyncio
     async def test_apply_operations_keeps_source_when_rename_write_fails(self):
         source_uri = "viking://user/u/memories/entities/person/阿珍.md"
         target_uri = "viking://user/u/memories/entities/person/陈静娴.md"

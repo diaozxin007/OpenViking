@@ -1182,6 +1182,20 @@ class MemoryUpdater:
         seen_targets: Dict[str, str] = {}
         viking_fs = self._get_viking_fs()
         for source_uri, target_uri in migrations:
+            if _same_batch_delete_conflict_key(source_uri) == _same_batch_delete_conflict_key(
+                target_uri
+            ):
+                errors.append(
+                    (
+                        source_uri,
+                        ConflictError(
+                            "Case-only memory URI renames are not portable; choose a distinct "
+                            f"target name: {source_uri} -> {target_uri}",
+                            resource=target_uri,
+                        ),
+                    )
+                )
+                continue
             if upsert_targets.get(target_uri, 0) > 1:
                 errors.append(
                     (
