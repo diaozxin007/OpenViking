@@ -978,6 +978,20 @@ class MemoryUpdater:
             for source_uri, target_uri in uri_remap.items()
             if target_uri not in failed_upsert_uris
         }
+        invalid_replacement_sources = await self._invalid_replacement_sources(
+            active_uri_remap,
+            successful_upsert_uris=set(result.written_uris + result.edited_uris),
+            scheduled_delete_uris={
+                file.uri for file in operations.delete_file_contents if file.uri
+            },
+            result=result,
+            ctx=ctx,
+        )
+        active_uri_remap = {
+            source_uri: target_uri
+            for source_uri, target_uri in active_uri_remap.items()
+            if source_uri not in invalid_replacement_sources
+        }
         operations.delete_replacements = active_uri_remap
         operations.resolved_links = remap_stored_links(original_links, active_uri_remap)
         link_migration_failed = not await self._inherit_deleted_link_relations(
@@ -1006,6 +1020,8 @@ class MemoryUpdater:
                 )
                 result.add_error(delete_uri, delete_error)
                 tracer.error(f"Skipping delete for {delete_uri}: {delete_error}")
+                continue
+            if delete_uri in invalid_replacement_sources:
                 continue
             if delete_uri in failed_link_migration_sources:
                 delete_error = ValueError("Skipped delete because link migration did not complete")
@@ -1094,6 +1110,54 @@ class MemoryUpdater:
             )
 
         return result
+
+    async def _invalid_replacement_sources(
+        self,
+        uri_remap: Dict[str, str],
+        *,
+        successful_upsert_uris: set[str],
+        scheduled_delete_uris: set[str],
+        result: MemoryUpdateResult,
+        ctx: RequestContext,
+    ) -> set[str]:
+        """Return replacement sources whose final target is cyclic or unavailable."""
+        invalid_sources: set[str] = set()
+        checked_targets: Dict[str, Exception | None] = {}
+        viking_fs = self._get_viking_fs()
+        for source_uri in uri_remap:
+            target_uri = _resolve_replacement_uri(source_uri, uri_remap)
+            if not target_uri or target_uri == source_uri:
+                error = ConflictError(
+                    f"Memory replacement cycle detected for {source_uri}",
+                    resource=source_uri,
+                )
+                result.add_error(source_uri, error)
+                invalid_sources.add(source_uri)
+                continue
+            if target_uri in successful_upsert_uris:
+                continue
+            if target_uri in scheduled_delete_uris:
+                error = ConflictError(
+                    f"Memory replacement target is also scheduled for deletion: {target_uri}",
+                    resource=target_uri,
+                )
+                result.add_error(source_uri, error)
+                invalid_sources.add(source_uri)
+                continue
+            if target_uri not in checked_targets:
+                try:
+                    await viking_fs.read_file(target_uri, ctx=ctx)
+                    checked_targets[target_uri] = None
+                except (NotFoundError, FileNotFoundError):
+                    checked_targets[target_uri] = NotFoundError(target_uri, "replacement memory")
+                except Exception as exc:
+                    checked_targets[target_uri] = exc
+            target_error = checked_targets[target_uri]
+            if target_error is None:
+                continue
+            result.add_error(source_uri, target_error)
+            invalid_sources.add(source_uri)
+        return invalid_sources
 
     @staticmethod
     def _is_uri_migration(operation: ResolvedOperation) -> bool:

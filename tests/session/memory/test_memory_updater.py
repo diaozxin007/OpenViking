@@ -1408,6 +1408,61 @@ class TestMemoryUpdater:
         updater._apply_delete.assert_awaited_once_with(source_uri, ctx, lease_ref=None)
 
     @pytest.mark.asyncio
+    async def test_apply_operations_keeps_source_when_explicit_replacement_is_missing(self):
+        source_uri = "viking://user/u/memories/entities/person/阿珍.md"
+        target_uri = "viking://user/u/memories/entities/person/陈静娴.md"
+        source_file = MemoryFile(uri=source_uri, memory_type="entities", content="source")
+        mock_viking_fs = MagicMock()
+        mock_viking_fs.read_file = AsyncMock(side_effect=NotFoundError(target_uri, "file"))
+        updater = MemoryUpdater(registry=MagicMock())
+        updater._get_viking_fs = MagicMock(return_value=mock_viking_fs)
+        updater._apply_delete = AsyncMock()
+        updater._sync_resource_refs_for_result = AsyncMock()
+        updater._vectorize_memories = AsyncMock()
+        updater.generate_overview = AsyncMock()
+        operations = ResolvedOperations(
+            upsert_operations=[],
+            delete_file_contents=[source_file],
+            delete_replacements={source_uri: target_uri},
+            errors=[],
+        )
+
+        result = await updater.apply_operations(operations, MagicMock())
+
+        assert result.deleted_uris == []
+        assert len(result.errors) == 1
+        assert result.errors[0][0] == source_uri
+        updater._apply_delete.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_apply_operations_rejects_replacement_cycle(self):
+        first_uri = "viking://user/u/memories/entities/person/first.md"
+        second_uri = "viking://user/u/memories/entities/person/second.md"
+        first = MemoryFile(uri=first_uri, memory_type="entities", content="first")
+        second = MemoryFile(uri=second_uri, memory_type="entities", content="second")
+        mock_viking_fs = MagicMock()
+        updater = MemoryUpdater(registry=MagicMock())
+        updater._get_viking_fs = MagicMock(return_value=mock_viking_fs)
+        updater._apply_delete = AsyncMock()
+        updater._sync_resource_refs_for_result = AsyncMock()
+        updater._vectorize_memories = AsyncMock()
+        updater.generate_overview = AsyncMock()
+        operations = ResolvedOperations(
+            upsert_operations=[],
+            delete_file_contents=[first, second],
+            delete_replacements={first_uri: second_uri, second_uri: first_uri},
+            errors=[],
+        )
+
+        result = await updater.apply_operations(operations, MagicMock())
+
+        assert result.deleted_uris == []
+        assert len(result.errors) == 2
+        assert all(isinstance(error, ConflictError) for _uri, error in result.errors)
+        mock_viking_fs.read_file.assert_not_called()
+        updater._apply_delete.assert_not_awaited()
+
+    @pytest.mark.asyncio
     async def test_apply_operations_keeps_source_when_link_migration_fails(self):
         source_uri = "viking://user/u/memories/entities/person/阿珍.md"
         target_uri = "viking://user/u/memories/entities/person/陈静娴.md"
