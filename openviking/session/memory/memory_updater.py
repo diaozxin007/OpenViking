@@ -1292,8 +1292,14 @@ class MemoryUpdater:
                     old_content = MemoryFileUtils.read(content, uri=uri)
             except ConflictError:
                 raise
-            except Exception:
+            except (NotFoundError, FileNotFoundError):
                 # File doesn't exist yet, that's okay
+                pass
+            except Exception:
+                if is_uri_migration:
+                    raise
+                # Preserve the legacy in-place update fallback to the prefetched
+                # snapshot when a fresh disk read is unavailable.
                 pass
             # Fall back to pre-fetched content if disk read failed
             if old_content is None:
