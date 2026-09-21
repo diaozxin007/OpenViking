@@ -28,6 +28,9 @@ from openviking.session.memory.consolidation_context_provider import (
 from openviking.session.memory.extract_loop import ExtractLoop
 from openviking.session.memory.memory_type_registry import get_default_registry
 from openviking.session.memory.memory_updater import MemoryUpdater
+from openviking.session.memory.streaming_memory_updater import (
+    acquire_memory_operation_lease,
+)
 from openviking.telemetry import tracer
 from openviking.telemetry.span_models import create_root_span_attributes
 from openviking_cli.exceptions import InvalidArgumentError
@@ -267,13 +270,23 @@ class MemoryCompileRunner:
                 "errors": [],
             }
 
-        updater = MemoryUpdater(registry=registry, vikingdb=self._vikingdb)
-        apply_result = await updater.apply_operations(
-            operations,
-            ctx,
-            extract_context=extract_context,
-            isolation_handler=isolation_handler,
-        )
+        viking_fs = provider._viking_fs
+        lease = await acquire_memory_operation_lease(operations, viking_fs, ctx)
+        try:
+            updater = MemoryUpdater(
+                registry=registry,
+                vikingdb=self._vikingdb,
+                transaction_handle=lease,
+            )
+            apply_result = await updater.apply_operations(
+                operations,
+                ctx,
+                extract_context=extract_context,
+                isolation_handler=isolation_handler,
+            )
+        finally:
+            if lease is not None:
+                await viking_fs._async_agfs.pathlock_release(lease)
 
         # Classify each touched URI as add vs update using the files the model
         # actually read. ExtractLoop's write-before-read guard guarantees any

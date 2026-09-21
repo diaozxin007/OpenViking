@@ -226,6 +226,11 @@ async def test_compile_resolves_language_before_prompt_and_schema(
     monkeypatch.setattr(registry, "get", lambda name: schema)
     apply = AsyncMock(return_value=MemoryUpdateResult())
     monkeypatch.setattr("openviking.service.memory_compile.MemoryUpdater.apply_operations", apply)
+    acquire_lease = AsyncMock(return_value=None)
+    monkeypatch.setattr(
+        "openviking.service.memory_compile.acquire_memory_operation_lease",
+        acquire_lease,
+    )
     runner = MemoryCompileRunner(SimpleNamespace(_ensure_initialized=lambda: viking_fs))
 
     result = await runner._consolidate(
@@ -244,6 +249,7 @@ async def test_compile_resolves_language_before_prompt_and_schema(
     assert content not in str(vlm.get_completion_async.call_args.kwargs["messages"])
     assert result["errors"] == []
     apply.assert_awaited_once()
+    acquire_lease.assert_awaited_once()
     if override:
         viking_fs.read.assert_not_awaited()
     else:

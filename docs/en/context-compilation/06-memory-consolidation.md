@@ -53,6 +53,8 @@ The command returns a `cmp_...` task ID immediately. Use `ov task status <id>` t
 - **Conservative merging**: only memories that are clearly the same identity are merged; distinct entities are kept separate even when they share a topic, category, or attributes. A merge the model cannot infer from content (e.g. two different names that are actually one person) is performed only when `--instruction` spells it out.
 - **No fabrication**: it only reorganizes existing memories; it never invents new facts.
 - **Facts preserved**: merges and compaction keep every distinct atomic fact and only compress duplicate wording.
+- **Rename support**: when the schema allows a URI-defining field to change (for example an entity's `category` or `name`), consolidation writes the new URI, migrates links/backlinks, and then deletes the old URI. The result reports this as the new URI in `adds` and the old URI in `deletes`.
+- **No conflict overwrite**: if the rename destination already exists, consolidation reports a conflict instead of overwriting it. The model must read both memories, update the explicit target with every distinct fact, and then delete the source with a replacement relationship.
 
 ## Result
 

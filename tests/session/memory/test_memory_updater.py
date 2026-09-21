@@ -41,7 +41,7 @@ from openviking.session.memory.utils import (
     parse_memory_file_with_fields,
 )
 from openviking.storage.abstract_overview import parse_abstract_overview
-from openviking_cli.exceptions import NotFoundError
+from openviking_cli.exceptions import ConflictError, NotFoundError
 from openviking_cli.session.user_id import UserIdentifier
 
 
@@ -1018,6 +1018,252 @@ class TestMemoryUpdater:
         assert {(link["from_uri"], link["to_uri"]) for link in profile.backlinks} == {
             (replacement_uri, profile_uri)
         }
+
+    @pytest.mark.asyncio
+    async def test_apply_operations_migrates_uri_and_preserves_unmodified_fields(self):
+        source_uri = "viking://user/u/memories/entities/person/阿珍.md"
+        target_uri = "viking://user/u/memories/entities/person/陈静娴.md"
+        profile_uri = "viking://user/u/memories/profile.md"
+        schema = MemoryTypeSchema(
+            memory_type="entities",
+            directory="viking://user/{{ user_space }}/memories/entities",
+            filename_template="{{ category }}/{{ name }}.md",
+            fields=[
+                MemoryField(
+                    name="category",
+                    field_type=FieldType.STRING,
+                    merge_op=MergeOp.REPLACE,
+                ),
+                MemoryField(
+                    name="name",
+                    field_type=FieldType.STRING,
+                    merge_op=MergeOp.REPLACE,
+                ),
+                MemoryField(
+                    name="content",
+                    field_type=FieldType.STRING,
+                    merge_op=MergeOp.PATCH,
+                ),
+            ],
+        )
+        registry = MemoryTypeRegistry(load_schemas=False)
+        registry.register(schema)
+        old_file = MemoryFile(
+            uri=source_uri,
+            memory_type="entities",
+            content="大学室友，仗义借钱。",
+            extra_fields={
+                "category": "person",
+                "name": "阿珍",
+                "custom_metadata": "keep",
+                "version": 3,
+            },
+            links=[
+                {
+                    "from_uri": source_uri,
+                    "to_uri": profile_uri,
+                    "link_type": "related_to",
+                    "weight": 0.8,
+                    "match_text": "室友",
+                    "description": "关系",
+                }
+            ],
+        )
+        profile_file = MemoryFile(
+            uri=profile_uri,
+            memory_type="profile",
+            content="小美",
+            backlinks=list(old_file.links),
+        )
+        store = {
+            source_uri: MemoryFileUtils.write(old_file),
+            profile_uri: MemoryFileUtils.write(profile_file),
+        }
+        mock_viking_fs = MagicMock()
+
+        async def read_file(uri, **kwargs):
+            if uri not in store:
+                raise NotFoundError(uri, "file")
+            return store[uri]
+
+        async def write_file(uri, content, **kwargs):
+            store[uri] = content
+
+        async def rm(uri, **kwargs):
+            store.pop(uri, None)
+
+        mock_viking_fs.read_file = AsyncMock(side_effect=read_file)
+        mock_viking_fs.write_file = AsyncMock(side_effect=write_file)
+        mock_viking_fs.rm = AsyncMock(side_effect=rm)
+        updater = MemoryUpdater(registry=registry)
+        updater._get_viking_fs = MagicMock(return_value=mock_viking_fs)
+        updater._sync_resource_refs_for_result = AsyncMock()
+        updater._vectorize_memories = AsyncMock()
+        updater.generate_overview = AsyncMock()
+        operations = ResolvedOperations(
+            upsert_operations=[
+                ResolvedOperation(
+                    old_memory_file_content=old_file,
+                    memory_fields={"category": "person", "name": "陈静娴"},
+                    memory_type="entities",
+                    uris=[target_uri],
+                )
+            ],
+            delete_file_contents=[],
+            errors=[],
+        )
+
+        ctx = MagicMock()
+        result = await updater.apply_operations(operations, ctx)
+
+        assert result.written_uris == [target_uri]
+        assert result.deleted_uris == [source_uri]
+        assert source_uri not in store
+        migrated = MemoryFileUtils.read(store[target_uri], uri=target_uri)
+        assert migrated.plain_content() == "大学室友，仗义借钱。"
+        assert migrated.extra_fields["category"] == "person"
+        assert migrated.extra_fields["name"] == "陈静娴"
+        assert migrated.extra_fields["custom_metadata"] == "keep"
+        assert migrated.extra_fields["version"] == 4
+        assert migrated.links[0]["from_uri"] == target_uri
+        profile = MemoryFileUtils.read(store[profile_uri], uri=profile_uri)
+        assert profile.backlinks[0]["from_uri"] == target_uri
+        assert operations.delete_replacements == {source_uri: target_uri}
+
+    @pytest.mark.asyncio
+    async def test_apply_operations_rejects_occupied_rename_target_before_writes(self):
+        source_uri = "viking://user/u/memories/entities/person/阿珍.md"
+        target_uri = "viking://user/u/memories/entities/person/陈静娴.md"
+        old_file = MemoryFile(uri=source_uri, memory_type="entities", content="source")
+        mock_viking_fs = MagicMock()
+        mock_viking_fs.read_file = AsyncMock(return_value="occupied")
+        updater = MemoryUpdater(registry=MagicMock())
+        updater._get_viking_fs = MagicMock(return_value=mock_viking_fs)
+        updater._apply_upsert = AsyncMock()
+        updater._apply_delete = AsyncMock()
+        operations = ResolvedOperations(
+            upsert_operations=[
+                ResolvedOperation(
+                    old_memory_file_content=old_file,
+                    memory_fields={"name": "陈静娴"},
+                    memory_type="entities",
+                    uris=[target_uri],
+                )
+            ],
+            delete_file_contents=[],
+            errors=[],
+        )
+
+        result = await updater.apply_operations(operations, MagicMock())
+
+        assert len(result.errors) == 1
+        assert isinstance(result.errors[0][1], ConflictError)
+        updater._apply_upsert.assert_not_awaited()
+        updater._apply_delete.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_apply_operations_keeps_source_when_rename_write_fails(self):
+        source_uri = "viking://user/u/memories/entities/person/阿珍.md"
+        target_uri = "viking://user/u/memories/entities/person/陈静娴.md"
+        old_file = MemoryFile(uri=source_uri, memory_type="entities", content="source")
+        mock_viking_fs = MagicMock()
+        mock_viking_fs.read_file = AsyncMock(side_effect=NotFoundError(target_uri, "file"))
+        updater = MemoryUpdater(registry=MagicMock())
+        updater._get_viking_fs = MagicMock(return_value=mock_viking_fs)
+        updater._apply_upsert = AsyncMock(side_effect=OSError("write failed"))
+        updater._apply_delete = AsyncMock()
+        updater._sync_resource_refs_for_result = AsyncMock()
+        updater._vectorize_memories = AsyncMock()
+        updater.generate_overview = AsyncMock()
+        operations = ResolvedOperations(
+            upsert_operations=[
+                ResolvedOperation(
+                    old_memory_file_content=old_file,
+                    memory_fields={"name": "陈静娴"},
+                    memory_type="entities",
+                    uris=[target_uri],
+                )
+            ],
+            delete_file_contents=[],
+            errors=[],
+        )
+
+        result = await updater.apply_operations(operations, MagicMock())
+
+        assert any(uri == target_uri for uri, _error in result.errors)
+        assert result.deleted_uris == []
+        updater._apply_delete.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_apply_operations_explicit_merge_to_existing_target_is_allowed(self):
+        source_uri = "viking://user/u/memories/entities/person/阿珍.md"
+        target_uri = "viking://user/u/memories/entities/person/陈静娴.md"
+        source_file = MemoryFile(uri=source_uri, memory_type="entities", content="source")
+        target_file = MemoryFile(uri=target_uri, memory_type="entities", content="merged")
+        mock_viking_fs = MagicMock()
+        mock_viking_fs.read_file = AsyncMock(return_value="occupied")
+        updater = MemoryUpdater(registry=MagicMock())
+        updater._get_viking_fs = MagicMock(return_value=mock_viking_fs)
+        updater._apply_upsert = AsyncMock()
+        updater._apply_delete = AsyncMock()
+        updater._sync_resource_refs_for_result = AsyncMock()
+        updater._vectorize_memories = AsyncMock()
+        updater.generate_overview = AsyncMock()
+        operations = ResolvedOperations(
+            upsert_operations=[
+                ResolvedOperation(
+                    old_memory_file_content=target_file,
+                    memory_fields={"content": "merged"},
+                    memory_type="entities",
+                    uris=[target_uri],
+                )
+            ],
+            delete_file_contents=[source_file],
+            delete_replacements={source_uri: target_uri},
+            errors=[],
+        )
+
+        ctx = MagicMock()
+        result = await updater.apply_operations(operations, ctx)
+
+        assert result.edited_uris == [target_uri]
+        assert result.deleted_uris == [source_uri]
+        updater._apply_upsert.assert_awaited_once()
+        updater._apply_delete.assert_awaited_once_with(source_uri, ctx, lease_ref=None)
+
+    @pytest.mark.asyncio
+    async def test_apply_operations_keeps_source_when_link_migration_fails(self):
+        source_uri = "viking://user/u/memories/entities/person/阿珍.md"
+        target_uri = "viking://user/u/memories/entities/person/陈静娴.md"
+        source_file = MemoryFile(uri=source_uri, memory_type="entities", content="source")
+        mock_viking_fs = MagicMock()
+        mock_viking_fs.read_file = AsyncMock(side_effect=NotFoundError(target_uri, "file"))
+        updater = MemoryUpdater(registry=MagicMock())
+        updater._get_viking_fs = MagicMock(return_value=mock_viking_fs)
+        updater._apply_upsert = AsyncMock()
+        updater._inherit_deleted_link_relations = AsyncMock(return_value=False)
+        updater._apply_delete = AsyncMock()
+        updater._sync_resource_refs_for_result = AsyncMock()
+        updater._vectorize_memories = AsyncMock()
+        updater.generate_overview = AsyncMock()
+        operations = ResolvedOperations(
+            upsert_operations=[
+                ResolvedOperation(
+                    old_memory_file_content=source_file,
+                    memory_fields={"name": "陈静娴"},
+                    memory_type="entities",
+                    uris=[target_uri],
+                )
+            ],
+            delete_file_contents=[],
+            errors=[],
+        )
+
+        result = await updater.apply_operations(operations, MagicMock())
+
+        assert result.deleted_uris == []
+        assert any(uri == source_uri for uri, _error in result.errors)
+        updater._apply_delete.assert_not_awaited()
 
     @pytest.mark.asyncio
     async def test_apply_operations_routes_backlinks_to_matching_uri_only(self):

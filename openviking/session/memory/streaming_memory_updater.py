@@ -498,7 +498,7 @@ class StreamingMemoryUpdater:
         isolation_handler = _make_isolation_handler(request, extract_context)
         async with self._apply_lock:
             viking_fs = safe_get_viking_fs()
-            lease = await _acquire_stable_operation_lease(
+            lease = await acquire_memory_operation_lease(
                 operations,
                 viking_fs,
                 request.ctx,
@@ -1005,10 +1005,10 @@ async def merge_one_memory_type_operations(
     required_file_uris = list(
         dict.fromkeys(
             [
-                uri
+                op.old_memory_file_content.uri
                 for op in operations
-                for uri in op.uris
                 if getattr(op, "old_memory_file_content", None) is not None
+                and op.old_memory_file_content.uri
             ]
             + [df.uri for df in delete_files if df.uri]
         )
@@ -1550,9 +1550,8 @@ def seed_patch_merge_read_contents(
 ) -> None:
     for op in operations:
         old_file = getattr(op, "old_memory_file_content", None)
-        uri = _first_uri(getattr(op, "uris", []) or [])
-        if old_file is not None and uri:
-            provider.read_file_contents[uri] = old_file
+        if old_file is not None and old_file.uri:
+            provider.read_file_contents[old_file.uri] = old_file
 
 
 def safe_get_viking_fs() -> Any | None:
@@ -2164,7 +2163,7 @@ async def _persisted_replacement_relation_uris(
     return uris
 
 
-async def _acquire_stable_operation_lease(
+async def acquire_memory_operation_lease(
     operations: ResolvedOperations,
     viking_fs: Any | None,
     ctx: RequestContext,

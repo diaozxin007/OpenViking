@@ -30,11 +30,18 @@ from openviking.session.memory.extraction_output_protocol import (
     create_extraction_output_protocol,
 )
 from openviking.session.memory.memory_isolation_handler import MemoryIsolationHandler
-from openviking.session.memory.merge_op import FieldType, ImmutableOp, MergeOp, PatchOp
+from openviking.session.memory.merge_op import (
+    FieldType,
+    ImmutableOp,
+    MergeOp,
+    MergeOpFactory,
+    PatchOp,
+)
 from openviking.session.memory.page_id_map import ResponsePageIdAllocator
 from openviking.session.memory.schema_model_generator import SchemaModelGenerator
 from openviking.session.memory.tools import MEMORY_TOOLS_REGISTRY
 from openviking.session.memory.utils.json_parser import JsonUtils
+from openviking.session.memory.utils.uri import generate_uri
 from openviking.storage.viking_fs import VikingFS, get_viking_fs
 from openviking.telemetry import bind_telemetry_stage, tracer
 from openviking_cli.utils import get_logger
@@ -868,6 +875,13 @@ class ExtractLoop:
                                     resolved_op.memory_fields[field_name] = (
                                         old_content.extra_fields[field_name]
                                     )
+                            target_uri = await self._updated_uri_for_existing_operation(
+                                resolved_op,
+                                schema=schema,
+                                source_uri=resolved_uri,
+                            )
+                            if target_uri != resolved_uri:
+                                resolved_op.uris = [target_uri]
                     else:
                         resolved_op.uris = self._isolation_handler.calculate_memory_uris(
                             memory_type_schema=schema,
@@ -883,8 +897,18 @@ class ExtractLoop:
 
                 upsert_operations.append(resolved_op)
 
-        delete_ids = self._normalize_delete_ids(getattr(operations, "delete_ids", []) or [])
         delete_replacements: dict[str, str] = {}
+        for operation in upsert_operations:
+            old_file = operation.old_memory_file_content
+            if old_file is None or not old_file.uri or not operation.uris:
+                continue
+            target_uri = operation.uris[0]
+            if target_uri == old_file.uri:
+                continue
+            delete_file_contents.append(old_file)
+            delete_replacements[old_file.uri] = target_uri
+
+        delete_ids = self._normalize_delete_ids(getattr(operations, "delete_ids", []) or [])
         for delete_id in delete_ids:
             if delete_id.delete_page_id is None or page_id_map is None:
                 continue
@@ -918,14 +942,19 @@ class ExtractLoop:
                         delete_id.replacement_page_id,
                     )
                     continue
-                replacement_uri = page_id_map.resolve(replacement_page_id)
+                replacement_uri = next(
+                    (
+                        op.uris[0]
+                        for op in upsert_operations
+                        if op.page_id == replacement_page_id and op.uris
+                    ),
+                    None,
+                )
                 if not replacement_uri:
-                    for op in upsert_operations:
-                        if op.page_id == replacement_page_id and op.uris:
-                            replacement_uri = op.uris[0]
-                            break
+                    replacement_uri = page_id_map.resolve(replacement_page_id)
 
-            delete_file_contents.append(old_content)
+            if all(file.uri != old_content.uri for file in delete_file_contents):
+                delete_file_contents.append(old_content)
             if replacement_uri and replacement_uri != delete_uri:
                 delete_replacements[delete_uri] = replacement_uri
 
@@ -957,6 +986,49 @@ class ExtractLoop:
                     break
 
         return resolved, raw_links
+
+    async def _updated_uri_for_existing_operation(
+        self,
+        operation: ResolvedOperation,
+        *,
+        schema: Any,
+        source_uri: str,
+    ) -> str:
+        """Recompute an existing object's URI after mutable identity-field updates."""
+        old_content = operation.old_memory_file_content
+        if old_content is None:
+            return source_uri
+
+        uri_fields = dict(old_content.extra_fields or {})
+        schema_fields = {field.name: field for field in schema.fields}
+        for field_name in schema.identity_fields(include_peer_id=False):
+            field = schema_fields.get(field_name)
+            if field is None or field_name not in operation.memory_fields:
+                continue
+            current_value = (
+                old_content.plain_content()
+                if field_name == "content"
+                else old_content.extra_fields.get(field_name)
+            )
+            try:
+                uri_fields[field_name] = await MergeOpFactory.from_field(field).apply(
+                    current_value,
+                    operation.memory_fields[field_name],
+                )
+            except Exception:
+                uri_fields[field_name] = current_value
+
+        prefix = "viking://user/"
+        namespace, separator, _ = source_uri.partition("/memories/")
+        if not separator or not namespace.startswith(prefix):
+            return source_uri
+        user_space = namespace.removeprefix(prefix)
+        return generate_uri(
+            memory_type=schema,
+            fields=uri_fields,
+            user_space=user_space,
+            extract_context=self._extract_context,
+        )
 
     def _normalize_delete_ids(self, raw_delete_ids: List[Any]) -> List[DeleteId]:
         delete_ids: List[DeleteId] = []
@@ -1024,7 +1096,7 @@ class ExtractLoop:
                 if page_id is None:
                     continue
                 uri = page_id_map.resolve(page_id)
-                if uri:
+                if uri and page_id not in op_page_map:
                     page_uri_map.setdefault(page_id, [])
                     if uri not in page_uri_map[page_id]:
                         page_uri_map[page_id].insert(0, uri)

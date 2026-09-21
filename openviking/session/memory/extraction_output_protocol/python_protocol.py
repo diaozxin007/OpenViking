@@ -23,6 +23,7 @@ from openviking.session.memory.merge_op import (
     FieldType,
     ImmutableOp,
     MergeOp,
+    MergeOpFactory,
     SearchReplaceBlock,
     StrPatch,
 )
@@ -215,12 +216,18 @@ class PythonExtractionOutputProtocol(ExtractionOutputProtocol):
             )
             for field in schema.fields
         }
+        schema_fields = {field.name: field for field in schema.fields}
         for name, _type_name, description in fields:
             if name in merge_ops:
                 # Render only YAML field descriptions, using the same context and
                 # restricted renderer as JSON. Keep the DSL's own edit instructions
                 # instead of copying the JSON model's merge-operation wrappers.
                 description = render_description_template(description, context.template_context)
+                field = schema_fields[name]
+                if field.merge_op == MergeOp.REPLACE:
+                    description = MergeOpFactory.from_field(field).get_output_schema_description(
+                        description
+                    )
             normalized_description = " ".join(str(description or "").split())
             qualifier = f" [{merge_ops[name]}]" if name in merge_ops else ""
             lines.append(f"  - {_identifier_alias(name)}{qualifier}: {normalized_description}")
@@ -263,7 +270,10 @@ class PythonExtractionOutputProtocol(ExtractionOutputProtocol):
 - Update or delete an existing memory only through its system-provided bound object; never pass or construct a URI.
 - Create collection memories with listed sdk.create_<memory_type>(...) methods.
 - Set a single-file memory with its listed sdk.set_<memory_type>(...) method; each target scope has only one such object.
-- Existing-object identity, storage paths, and immutable fields are preserved by the system.
+- Existing-object immutable fields are preserved by the system. URI identity fields may be
+  updated when their schema allows it; changing one renames the memory object.
+- If a rename target already exists, do not rename over it. Read both objects, update the
+  canonical target with every distinct fact, then delete the source with replacement=target.
 - delete() removes the whole object; use obj.content.drop(text=...) (with the real field name) when only some content must go and the rest stays.
 - For canonical merges, use duplicate.delete(replacement=canonical); for pure deletes, call delete() without replacement.
 - delete(replacement=canonical) discards the duplicate's content entirely and keeps only the canonical. Before deleting a duplicate, first fold every distinct valid fact it holds into the canonical (e.g. canonical.content.edit(...)); merging or compacting must never drop a unique fact that only the duplicate recorded.
@@ -1212,10 +1222,15 @@ class _PythonProgramCompiler:
             fields = dict(obj.changed_fields)
             if obj.existing:
                 schema = self.schemas[obj.memory_type]
-                for memory_field in schema.fields:
-                    if memory_field.merge_op == MergeOp.IMMUTABLE:
-                        if memory_field.name in obj.fields:
-                            fields[memory_field.name] = obj.fields[memory_field.name]
+                required_existing_fields = set(schema.identity_fields(include_peer_id=False))
+                required_existing_fields.update(
+                    memory_field.name
+                    for memory_field in schema.fields
+                    if memory_field.merge_op == MergeOp.IMMUTABLE
+                )
+                for field_name in required_existing_fields:
+                    if field_name in obj.fields and field_name not in fields:
+                        fields[field_name] = obj.fields[field_name]
             payload[obj.memory_type].append({"page_id": obj.page_id, **fields})
         if self.context.link_enabled:
             payload["links"] = []
