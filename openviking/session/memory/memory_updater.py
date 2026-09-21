@@ -1301,6 +1301,15 @@ class MemoryUpdater:
                 # Preserve the legacy in-place update fallback to the prefetched
                 # snapshot when a fresh disk read is unavailable.
                 pass
+            if is_uri_migration:
+                try:
+                    source_raw = await viking_fs.read_file(source_content.uri, ctx=ctx)
+                    old_content = MemoryFileUtils.read(source_raw, uri=source_content.uri)
+                except (NotFoundError, FileNotFoundError):
+                    raise ConflictError(
+                        f"Memory rename source no longer exists: {source_content.uri}",
+                        resource=source_content.uri,
+                    ) from None
             # Fall back to pre-fetched content if disk read failed
             if old_content is None:
                 old_content = source_content

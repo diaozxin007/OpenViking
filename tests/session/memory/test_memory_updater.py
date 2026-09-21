@@ -1131,6 +1131,77 @@ class TestMemoryUpdater:
         assert operations.delete_replacements == {source_uri: target_uri}
 
     @pytest.mark.asyncio
+    async def test_apply_operations_rename_reads_latest_source_under_lock(self):
+        source_uri = "viking://user/u/memories/entities/person/阿珍.md"
+        target_uri = "viking://user/u/memories/entities/person/陈静娴.md"
+        stale_file = MemoryFile(
+            uri=source_uri,
+            memory_type="entities",
+            content="stale fact",
+            extra_fields={"category": "person", "name": "阿珍", "version": 1},
+        )
+        current_file = stale_file.model_copy(
+            update={
+                "content": "stale fact; concurrent fact",
+                "extra_fields": {
+                    "category": "person",
+                    "name": "阿珍",
+                    "version": 2,
+                },
+            }
+        )
+        store = {source_uri: MemoryFileUtils.write(current_file)}
+        mock_viking_fs = MagicMock()
+
+        async def read_file(uri, **kwargs):
+            if uri not in store:
+                raise NotFoundError(uri, "file")
+            return store[uri]
+
+        async def write_file(uri, content, **kwargs):
+            store[uri] = content
+
+        async def rm(uri, **kwargs):
+            store.pop(uri, None)
+
+        mock_viking_fs.read_file = AsyncMock(side_effect=read_file)
+        mock_viking_fs.write_file = AsyncMock(side_effect=write_file)
+        mock_viking_fs.rm = AsyncMock(side_effect=rm)
+        schema = MemoryTypeSchema(
+            memory_type="entities",
+            fields=[
+                MemoryField(name="name", field_type=FieldType.STRING, merge_op=MergeOp.REPLACE),
+                MemoryField(name="content", field_type=FieldType.STRING, merge_op=MergeOp.PATCH),
+            ],
+        )
+        registry = MemoryTypeRegistry(load_schemas=False)
+        registry.register(schema)
+        updater = MemoryUpdater(registry=registry)
+        updater._get_viking_fs = MagicMock(return_value=mock_viking_fs)
+        updater._sync_resource_refs_for_result = AsyncMock()
+        updater._vectorize_memories = AsyncMock()
+        updater.generate_overview = AsyncMock()
+        operations = ResolvedOperations(
+            upsert_operations=[
+                ResolvedOperation(
+                    old_memory_file_content=stale_file,
+                    memory_fields={"name": "陈静娴"},
+                    memory_type="entities",
+                    uris=[target_uri],
+                )
+            ],
+            delete_file_contents=[],
+            errors=[],
+        )
+
+        result = await updater.apply_operations(operations, MagicMock())
+
+        assert result.errors == []
+        migrated = MemoryFileUtils.read(store[target_uri], uri=target_uri)
+        assert migrated.plain_content() == "stale fact; concurrent fact"
+        assert migrated.extra_fields["version"] == 3
+
+    @pytest.mark.asyncio
     async def test_apply_operations_rejects_occupied_rename_target_before_writes(self):
         source_uri = "viking://user/u/memories/entities/person/阿珍.md"
         target_uri = "viking://user/u/memories/entities/person/陈静娴.md"
