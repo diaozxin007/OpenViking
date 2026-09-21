@@ -21,6 +21,7 @@ from openviking.session.memory.consolidation_context_provider import (
     ConsolidationExtractContextProvider,
     build_consolidation_isolation_handler,
 )
+from openviking.session.memory.dataclass import MemoryFile, ResolvedOperation, ResolvedOperations
 from openviking.session.memory.memory_type_registry import get_default_registry
 from openviking.session.memory.memory_updater import ExtractContext, MemoryUpdateResult
 from openviking_cli.exceptions import InvalidArgumentError
@@ -255,6 +256,67 @@ async def test_compile_resolves_language_before_prompt_and_schema(
     else:
         viking_fs.read.assert_awaited_once_with(uri, size=4096, ctx=_ctx())
         assert content not in str(vlm.get_completion_async.call_args.kwargs["messages"])
+
+
+@pytest.mark.asyncio
+async def test_compile_reports_uri_migration_as_add_and_delete(monkeypatch, language_config):
+    language_config.output_language_override = "en"
+    language_config.vlm = SimpleNamespace(get_vlm_instance=lambda: SimpleNamespace(model="test"))
+    directory = "viking://user/u1/memories/entities"
+    source_uri = f"{directory}/person/old.md"
+    target_uri = f"{directory}/person/new.md"
+    source_file = MemoryFile(
+        uri=source_uri,
+        memory_type="entities",
+        content="source",
+        extra_fields={"category": "person", "name": "old"},
+    )
+    viking_fs = SimpleNamespace(
+        glob=AsyncMock(return_value={"matches": []}),
+        _async_agfs=SimpleNamespace(pathlock_release=AsyncMock()),
+    )
+    operations = ResolvedOperations(
+        upsert_operations=[
+            ResolvedOperation(
+                old_memory_file_content=source_file,
+                memory_fields={"category": "person", "name": "new"},
+                memory_type="entities",
+                uris=[target_uri],
+            )
+        ],
+        delete_file_contents=[],
+        errors=[],
+    )
+    monkeypatch.setattr(
+        "openviking.service.memory_compile.ExtractLoop.run",
+        AsyncMock(return_value=(operations, [])),
+    )
+    apply_result = MemoryUpdateResult()
+    apply_result.add_written(target_uri)
+    apply_result.add_deleted(source_uri)
+    monkeypatch.setattr(
+        "openviking.service.memory_compile.MemoryUpdater.apply_operations",
+        AsyncMock(return_value=apply_result),
+    )
+    monkeypatch.setattr(
+        "openviking.service.memory_compile.acquire_memory_operation_lease",
+        AsyncMock(return_value=None),
+    )
+    runner = MemoryCompileRunner(SimpleNamespace(_ensure_initialized=lambda: viking_fs))
+
+    result = await runner._consolidate(
+        target=directory,
+        memory_type="entities",
+        peer_id=None,
+        instruction="Rename old to new.",
+        ctx=_ctx(),
+    )
+
+    assert result["adds"] == [target_uri]
+    assert result["updates"] == []
+    assert result["deletes"] == [source_uri]
+    assert result["total_adds"] == 1
+    assert result["total_deletes"] == 1
 
 
 @pytest.mark.asyncio
