@@ -48,7 +48,7 @@ The command returns a `cmp_...` task ID immediately. Use `ov task status <id>` t
 
 ## Behavior
 
-- **Single type**: only the schema of the memory type inferred from `--to` is loaded; consolidation stays within that one type and never touches others.
+- **Single type**: only the schema of the memory type inferred from `--to` is loaded, and the model only produces content operations for that type. If a rename or merge affects existing links/backlinks, the system may still update neighboring memory files of other types to preserve referential integrity.
 - **In place**: `--from` and `--to` are the same space and no external source is introduced, so there is no cross-identity leakage. The space being consolidated (the current user's own *self* space, or a `peers/{peer_id}` space) is determined by the `--to` URI.
 - **Conservative merging**: only memories that are clearly the same identity are merged; distinct entities are kept separate even when they share a topic, category, or attributes. A merge the model cannot infer from content (e.g. two different names that are actually one person) is performed only when `--instruction` spells it out.
 - **No fabrication**: it only reorganizes existing memories; it never invents new facts.
