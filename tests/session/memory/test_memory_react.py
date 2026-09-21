@@ -284,6 +284,132 @@ class TestExtractLoopFinalJsonRetry:
         assert operation.old_memory_file_content is old_file
 
     @pytest.mark.asyncio
+    async def test_rename_conflict_refetches_target_then_requires_explicit_merge(self):
+        source_uri = "viking://user/user_a/memories/entities/person/阿珍.md"
+        target_uri = "viking://user/user_a/memories/entities/person/陈静娴.md"
+        source_file = MemoryFile(
+            uri=source_uri,
+            memory_type="entities",
+            content="大学室友",
+            extra_fields={"category": "person", "name": "阿珍"},
+        )
+        target_file = MemoryFile(
+            uri=target_uri,
+            memory_type="entities",
+            content="上海 UI 设计师",
+            extra_fields={"category": "person", "name": "陈静娴"},
+        )
+        schema = MemoryTypeSchema(
+            memory_type="entities",
+            directory="viking://user/{{ user_space }}/memories/entities",
+            filename_template="{{ category|lower }}/{{ name|lower }}.md",
+            fields=[
+                MemoryField(
+                    name="category",
+                    field_type=FieldType.STRING,
+                    merge_op=MergeOp.REPLACE,
+                ),
+                MemoryField(
+                    name="name",
+                    field_type=FieldType.STRING,
+                    merge_op=MergeOp.REPLACE,
+                ),
+                MemoryField(
+                    name="content",
+                    field_type=FieldType.STRING,
+                    merge_op=MergeOp.PATCH,
+                ),
+            ],
+        )
+        extract_context = SimpleNamespace(messages=[], page_id_map=PageIdMap())
+
+        class FakeContextProvider:
+            def __init__(self):
+                self.read_file_contents = {source_uri: source_file}
+                self.read_uris = []
+
+            def get_memory_schemas(self, ctx):
+                del ctx
+                return [schema]
+
+            def get_tools(self):
+                return []
+
+            def get_extract_context(self):
+                return extract_context
+
+            def get_output_language(self):
+                return "zh-CN"
+
+            def instruction(self):
+                return "Merge aliases without losing facts."
+
+            async def prefetch(self):
+                return []
+
+            async def execute_tool(self, tool_call):
+                uri = tool_call.arguments["uri"]
+                self.read_uris.append(uri)
+                assert uri == target_uri
+                self.read_file_contents[uri] = target_file
+                return {
+                    **target_file.to_metadata(),
+                    "page_id": extract_context.page_id_map.get_page_id(uri),
+                }
+
+        class FakeVLM:
+            model = "test-model"
+
+            def __init__(self):
+                self.responses = iter(
+                    [
+                        "entities_1.update(name='陈静娴')\nsdk.commit()",
+                        (
+                            "entities_2.content.update('大学室友；上海 UI 设计师')\n"
+                            "entities_1.delete(replacement=entities_2)\n"
+                            "sdk.commit()"
+                        ),
+                    ]
+                )
+
+            async def get_completion_async(self, **kwargs):
+                del kwargs
+                return next(self.responses)
+
+        provider = FakeContextProvider()
+        ctx = MagicMock()
+        ctx.user.user_id = "user_a"
+        config = SimpleNamespace(
+            memory=SimpleNamespace(link_enabled=False, extraction_output_format="python"),
+            vlm=SimpleNamespace(max_tokens=None),
+        )
+        loop = ExtractLoop(
+            vlm=FakeVLM(),
+            viking_fs=MagicMock(),
+            ctx=ctx,
+            context_provider=provider,
+            isolation_handler=MemoryIsolationHandler(ctx, extract_context),
+            max_iterations=2,
+        )
+
+        with (
+            patch(
+                "openviking.session.memory.extract_loop.get_openviking_config",
+                return_value=config,
+            ),
+            patch(
+                "openviking_cli.utils.config.get_openviking_config",
+                return_value=config,
+            ),
+        ):
+            operations, _ = await loop.run()
+
+        assert provider.read_uris == [target_uri]
+        assert [operation.uris for operation in operations.upsert_operations] == [[target_uri]]
+        assert [file.uri for file in operations.delete_file_contents] == [source_uri]
+        assert operations.delete_replacements == {source_uri: target_uri}
+
+    @pytest.mark.asyncio
     async def test_invalid_peer_hint_preserves_legacy_self_write_fallback(self):
         class PreferenceItem(BaseModel):
             page_id: int

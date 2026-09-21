@@ -375,6 +375,59 @@ async def test_replacement_reacquires_persisted_relation_locks_before_writes(mon
     assert fs.events.index(acquires[1]) < min(fs.events.index(event) for event in writes)
 
 
+async def test_streaming_apply_migrates_uri_under_one_stable_lease(monkeypatch):
+    source_uri = "viking://user/u/memories/notes/old.md"
+    target_uri = "viking://user/u/memories/notes/new.md"
+    old_file = MemoryFile(
+        uri=source_uri,
+        content="old content",
+        memory_type="notes",
+        extra_fields={"note_name": "old"},
+    )
+    fs = PathlockedInMemoryVikingFS({source_uri: MemoryFileUtils.write(old_file)})
+    fs.search = AsyncMock(return_value=[])
+    for module in ("streaming_memory_updater", "memory_updater"):
+        monkeypatch.setattr(f"openviking.session.memory.{module}.get_viking_fs", lambda: fs)
+
+    registry = _registry()
+    registry.get("notes").fields[0].merge_op = MergeOp.REPLACE
+    operations = ResolvedOperations(
+        upsert_operations=[
+            ResolvedOperation(
+                old_memory_file_content=old_file,
+                memory_type="notes",
+                uris=[target_uri],
+                memory_fields={"note_name": "new"},
+            )
+        ],
+        delete_file_contents=[],
+        errors=[],
+    )
+    messages = [Message(id="m1", role="user", parts=[TextPart("rename note")])]
+
+    result = await StreamingMemoryUpdater(registry=registry)._apply_operations(
+        operations=operations,
+        request=MemoryUpdateRequest(
+            operations=operations,
+            messages=messages,
+            ctx=_ctx(),
+            memory_registry=registry,
+        ),
+        messages=messages,
+    )
+
+    assert result.written_uris == [target_uri]
+    assert result.deleted_uris == [source_uri]
+    assert source_uri not in fs.files
+    assert MemoryFileUtils.read(fs.files[target_uri]).extra_fields["note_name"] == "new"
+    acquire = next(event for event in fs.events if event[0] == "acquire")
+    assert "/user/u/memories/notes/old.md" in acquire[1]
+    assert "/user/u/memories/notes/new.md" in acquire[1]
+    lease = {"lease_ref": "memory-batch-lease"}
+    assert all(event[2] == lease for event in fs.events if event[0] == "write")
+    assert fs.events[-1] == ("release", lease)
+
+
 async def test_operation_to_patch_skips_failed_field_preview_update():
     schema = MemoryTypeSchema(
         memory_type="notes",
