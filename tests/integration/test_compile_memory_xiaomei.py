@@ -68,7 +68,7 @@ class CompileCase:
     description: str
     rename_source_prefix: str | None = None
     rename_target_prefix: str | None = None
-    required_facts: tuple[str, ...] = ()
+    required_facts: tuple[tuple[str, ...], ...] = ()
 
 
 # A. 合并（merge）：两段独立对话，同一个人两个不同称呼（阿珍 / 陈静娴）。
@@ -155,10 +155,9 @@ CASE_RENAME = CompileCase(
     key="rename",
     memory_type="entities",
     instruction=(
-        "把实体「{source_name}」的 URI identity fields 完整替换为：category=`person`，"
-        "name=`{target_name}`。必须更新现有实体来触发文件改名，不要创建内容重复的第二个实体。"
-        "正文可以继续使用中文，并保留这些独立事实：小美的摄影老师、住在杭州、擅长风光摄影、"
-        "十月带小美去西湖练习长曝光。不要修改其它实体。"
+        "把人物「{source_name}」的目录和文件名改成英文：目录用 person，文件名用"
+        " {target_name}.md。保留摄影老师、杭州、风光摄影和十月去西湖练习长曝光等事实；"
+        "不要创建重复实体或修改其他实体。"
     ),
     sessions=[
         [
@@ -173,10 +172,19 @@ CASE_RENAME = CompileCase(
             }
         ]
     ],
-    description="把中文实体文件名改成英文（add 新 URI + delete 旧 URI），并迁移关系链接。",
+    description=(
+        "目录和文件名在中英文之间往返改名，每一步均为 add 新 URI + delete 旧 URI，并迁移关系链接。"
+    ),
     rename_source_prefix="罗晴",
-    rename_target_prefix="luo_qing",
-    required_facts=("摄影老师", "杭州", "风光摄影", "十月", "西湖", "长曝光"),
+    rename_target_prefix="photo_teacher",
+    required_facts=(
+        ("摄影老师", "photography teacher"),
+        ("杭州", "hangzhou"),
+        ("风光摄影", "landscape photography"),
+        ("十月", "october"),
+        ("西湖", "west lake"),
+        ("长曝光", "long exposure"),
+    ),
 )
 
 # E. 换 memory type：整理 preferences，而不是 entities，验证 compile 对不同 schema 都工作。
@@ -220,13 +228,14 @@ def _memory_dir(user: str, memory_type: str) -> str:
 
 
 def _unique_rename_names(case: CompileCase) -> tuple[str, str]:
-    token = uuid.uuid4().hex[:6]
+    token = uuid.uuid4().hex[:8]
     surnames = "赵钱孙李周吴郑王冯陈褚卫蒋沈韩杨"
     given_names = "清岚若晴雨桐诗涵婉宁静怡思远知夏"
     source_name = (
         surnames[int(token[:2], 16) % len(surnames)]
         + given_names[int(token[2:4], 16) % len(given_names)]
         + given_names[int(token[4:6], 16) % len(given_names)]
+        + given_names[int(token[6:8], 16) % len(given_names)]
     )
     return (
         source_name,
@@ -392,9 +401,14 @@ async def _verify_rename_case(
         )
 
     target_content = await client.read(target_uri)
-    missing_facts = [fact for fact in case.required_facts if fact not in target_content]
+    normalized_content = target_content.casefold()
+    missing_facts = [
+        alternatives
+        for alternatives in case.required_facts
+        if not any(term.casefold() in normalized_content for term in alternatives)
+    ]
     if missing_facts:
-        raise AssertionError(f"英文目标文件丢失事实: {missing_facts}\n{target_content}")
+        raise AssertionError(f"改名目标文件丢失事实: {missing_facts}\n{target_content}")
 
     stale_markers = {source_uri, source_uri.removeprefix("viking://user/")}
     source_rel = source_uri.removeprefix(directory.rstrip("/") + "/")
@@ -406,6 +420,140 @@ async def _verify_rename_case(
             raise AssertionError(f"关系迁移后仍残留旧 URI/href: {updated_uri} -> {found_markers}")
 
     console.print(f"  [bold green]rename 验证通过:[/bold green] {source_uri} → {target_uri}")
+
+
+async def _find_entity_uri_by_content(
+    client, directory: str, files: list[dict], source_name: str
+) -> str:
+    candidates = []
+    for entry in files:
+        uri = _entry_uri(entry)
+        relative_uri = uri.removeprefix(directory.rstrip("/") + "/")
+        if not relative_uri.startswith(("person/", "人物/")):
+            continue
+        content = await client.read(uri)
+        if source_name in content:
+            candidates.append(uri)
+    if len(candidates) != 1:
+        raise AssertionError(
+            f"rename case 需要按内容找到恰好一个人物「{source_name}」，实际: {candidates}"
+        )
+    return candidates[0]
+
+
+async def _run_rename_step(
+    client,
+    args,
+    case: CompileCase,
+    *,
+    directory: str,
+    label: str,
+    source_uri: str,
+    target_uri: str,
+    instruction: str,
+) -> list[dict]:
+    console.rule(f"[bold]Rename {label}: {source_uri} → {target_uri}[/bold]")
+    before = await _snapshot_memory_dir(client, directory)
+    before_uris = {_entry_uri(entry) for entry in before}
+    if source_uri not in before_uris or target_uri in before_uris:
+        raise AssertionError(
+            f"rename {label} 前置状态错误: source_exists={source_uri in before_uris}, "
+            f"target_exists={target_uri in before_uris}"
+        )
+
+    task = await _run_memory_compile(client, directory, instruction)
+    result = task.get("result") or {}
+    trace_id = result.get("trace_id") or task.get("trace_id") or ""
+    if trace_id:
+        console.print(f"  [bold cyan]trace_id: {trace_id}[/bold cyan]")
+    _render_change_lists(result)
+
+    await client.wait_processed()
+    if args.wait > 0:
+        await asyncio.sleep(args.wait)
+    after = await _snapshot_memory_dir(client, directory)
+    await _verify_rename_case(
+        client,
+        case=case,
+        directory=directory,
+        source_uri=source_uri,
+        target_uri=target_uri,
+        task=task,
+        after=after,
+    )
+    return after
+
+
+async def _run_rename_round_trip(
+    client,
+    args,
+    case: CompileCase,
+    *,
+    directory: str,
+    source_name: str,
+    english_name: str,
+    initial: list[dict],
+) -> None:
+    initial_uri = await _find_entity_uri_by_content(client, directory, initial, source_name)
+    english_uri = f"{directory.rstrip('/')}/person/{english_name}.md"
+    chinese_uri = f"{directory.rstrip('/')}/人物/{source_name}.md"
+
+    to_english = case.instruction.format(
+        source_name=source_name,
+        target_name=english_name,
+    )
+    await _run_rename_step(
+        client,
+        args,
+        case,
+        directory=directory,
+        label="initial → English",
+        source_uri=initial_uri,
+        target_uri=english_uri,
+        instruction=to_english,
+    )
+
+    to_chinese = (
+        f"把英文名为「{english_name}」的人物改回中文名「{source_name}」，同时把分类目录改成"
+        f"中文“人物”。保留摄影老师、杭州、风光摄影和十月去西湖练习长曝光等事实；"
+        f"不要创建重复实体或修改其他实体。"
+    )
+    await _run_rename_step(
+        client,
+        args,
+        case,
+        directory=directory,
+        label="English → Chinese",
+        source_uri=english_uri,
+        target_uri=chinese_uri,
+        instruction=to_chinese,
+    )
+
+    final = await _run_rename_step(
+        client,
+        args,
+        case,
+        directory=directory,
+        label="Chinese → English",
+        source_uri=chinese_uri,
+        target_uri=english_uri,
+        instruction=to_english,
+    )
+
+    console.rule(f"[bold]Rename round trip 最终状态 — {directory}[/bold]")
+    _render_snapshot("往返改名后", directory, final)
+    console.print(
+        Panel(
+            f"[bold]case:[/bold] {case.key}\n"
+            f"[bold]初始 URI:[/bold] {initial_uri}\n"
+            f"[bold]英文 URI:[/bold] {english_uri}\n"
+            f"[bold]中文 URI:[/bold] {chinese_uri}\n"
+            "[bold green]往返三步全部验证通过[/bold green]",
+            title="对比 — rename round trip",
+            style="magenta",
+            width=PANEL_WIDTH,
+        )
+    )
 
 
 # ── Phase 2: 触发 memory compile 并轮询 ─────────────────────────────────────
@@ -456,10 +604,8 @@ async def _run_case(client, args, case: CompileCase) -> None:
     directory = args.to or _memory_dir(args.user, case.memory_type)
     source_name = None
     target_name = None
-    instruction = case.instruction
     if case.rename_target_prefix:
         source_name, target_name = _unique_rename_names(case)
-        instruction = instruction.format(source_name=source_name, target_name=target_name)
 
     console.rule(f"[bold magenta]CASE: {case.key} — {case.description}[/bold magenta]")
 
@@ -476,24 +622,20 @@ async def _run_case(client, args, case: CompileCase) -> None:
     console.rule(f"[bold]Phase 1: 整理前 — {directory}[/bold]")
     before = await _snapshot_memory_dir(client, directory)
     _render_snapshot("整理前", directory, before)
-    source_uri = None
-    target_uri = None
     if source_name and target_name:
-        source_suffix = f"/{source_name}.md"
-        matching_sources = [
-            _entry_uri(entry) for entry in before if _entry_uri(entry).endswith(source_suffix)
-        ]
-        if len(matching_sources) != 1:
-            raise AssertionError(
-                f"rename case 需要恰好一个中文源文件 *{source_suffix}，实际: {matching_sources}"
-            )
-        source_uri = matching_sources[0]
-        target_uri = f"{directory.rstrip('/')}/person/{target_name}.md"
-        if target_uri in {_entry_uri(entry) for entry in before}:
-            raise AssertionError(f"动态英文目标 URI 意外已存在: {target_uri}")
+        await _run_rename_round_trip(
+            client,
+            args,
+            case,
+            directory=directory,
+            source_name=source_name,
+            english_name=target_name,
+            initial=before,
+        )
+        return
 
     console.rule("[bold]Phase 2: 执行 memory compile[/bold]")
-    task = await _run_memory_compile(client, directory, instruction)
+    task = await _run_memory_compile(client, directory, case.instruction)
 
     result = task.get("result") or {}
     trace_id = result.get("trace_id") or task.get("trace_id") or ""
@@ -513,17 +655,6 @@ async def _run_case(client, args, case: CompileCase) -> None:
     console.rule(f"[bold]Phase 3: 整理后 — {directory}[/bold]")
     after = await _snapshot_memory_dir(client, directory)
     _render_snapshot("整理后", directory, after)
-
-    if source_uri and target_uri:
-        await _verify_rename_case(
-            client,
-            case=case,
-            directory=directory,
-            source_uri=source_uri,
-            target_uri=target_uri,
-            task=task,
-            after=after,
-        )
 
     console.print()
     console.print(
@@ -606,7 +737,7 @@ def main():
         help=(
             "compile 集成 case（默认: all，依次跑全部）。"
             "merge=合并两个同人不同称呼；split=拆分同名两人；"
-            "dedup=原地精简重复表述；rename=中文文件名迁移为英文；"
+            "dedup=原地精简重复表述；rename=目录和文件名中英文往返；"
             "preferences=整理 preferences 类型。"
         ),
     )
