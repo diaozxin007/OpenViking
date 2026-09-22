@@ -21,6 +21,7 @@ OpenViking memory-mode compile 集成脚本 — 用户: 小美
 import argparse
 import asyncio
 import time
+import uuid
 from dataclasses import dataclass
 from datetime import datetime
 
@@ -65,6 +66,9 @@ class CompileCase:
     instruction: str
     sessions: list[list[dict]]
     description: str
+    rename_source_prefix: str | None = None
+    rename_target_prefix: str | None = None
+    required_facts: tuple[str, ...] = ()
 
 
 # A. 合并（merge）：两段独立对话，同一个人两个不同称呼（阿珍 / 陈静娴）。
@@ -145,7 +149,37 @@ CASE_DEDUP = CompileCase(
     description="同一实体反复重复陈述，compile 原地精简（update，文件变小）。",
 )
 
-# D. 换 memory type：整理 preferences，而不是 entities，验证 compile 对不同 schema 都工作。
+# D. 改名（rename）：先抽取中文实体名，再由 compile 修改 URI identity fields，
+# 验证表现为 add 英文 URI + delete 中文 URI，同时保留全部事实与关系链接。
+CASE_RENAME = CompileCase(
+    key="rename",
+    memory_type="entities",
+    instruction=(
+        "把实体「{source_name}」的 URI identity fields 完整替换为：category=`person`，"
+        "name=`{target_name}`。必须更新现有实体来触发文件改名，不要创建内容重复的第二个实体。"
+        "正文可以继续使用中文，并保留这些独立事实：小美的摄影老师、住在杭州、擅长风光摄影、"
+        "十月带小美去西湖练习长曝光。不要修改其它实体。"
+    ),
+    sessions=[
+        [
+            {
+                "user": (
+                    "我的摄影老师叫{source_name}，她住在杭州，专门拍风光摄影。"
+                    "她十月会带我去西湖练习长曝光。"
+                ),
+                "assistant": (
+                    "{source_name}老师的风光摄影经验很丰富，十月去西湖练习长曝光很值得期待。"
+                ),
+            }
+        ]
+    ],
+    description="把中文实体文件名改成英文（add 新 URI + delete 旧 URI），并迁移关系链接。",
+    rename_source_prefix="罗晴",
+    rename_target_prefix="luo_qing",
+    required_facts=("摄影老师", "杭州", "风光摄影", "十月", "西湖", "长曝光"),
+)
+
+# E. 换 memory type：整理 preferences，而不是 entities，验证 compile 对不同 schema 都工作。
 CASE_PREFERENCES = CompileCase(
     key="preferences",
     memory_type="preferences",
@@ -174,6 +208,7 @@ CASES: dict[str, CompileCase] = {
     CASE_MERGE.key: CASE_MERGE,
     CASE_SPLIT.key: CASE_SPLIT,
     CASE_DEDUP.key: CASE_DEDUP,
+    CASE_RENAME.key: CASE_RENAME,
     CASE_PREFERENCES.key: CASE_PREFERENCES,
 }
 
@@ -184,10 +219,30 @@ def _memory_dir(user: str, memory_type: str) -> str:
     return f"viking://user/{user}/memories/{memory_type}"
 
 
+def _unique_rename_names(case: CompileCase) -> tuple[str, str]:
+    token = uuid.uuid4().hex[:6]
+    surnames = "赵钱孙李周吴郑王冯陈褚卫蒋沈韩杨"
+    given_names = "清岚若晴雨桐诗涵婉宁静怡思远知夏"
+    source_name = (
+        surnames[int(token[:2], 16) % len(surnames)]
+        + given_names[int(token[2:4], 16) % len(given_names)]
+        + given_names[int(token[4:6], 16) % len(given_names)]
+    )
+    return (
+        source_name,
+        f"{case.rename_target_prefix}_{token}",
+    )
+
+
 # ── 为一个 case 追加种子对话（每段独立 commit），让抽取产生实体 ───────────────
 
 
-async def _ingest_case_sessions(client, case: CompileCase, wait_seconds: float) -> None:
+async def _ingest_case_sessions(
+    client,
+    case: CompileCase,
+    wait_seconds: float,
+    template_values: dict[str, str] | None = None,
+) -> None:
     """为 case 的每段对话独立开 session 并 commit，让抽取各自产出实体。"""
     base_time = datetime(2023, 4, 9, 20, 0)
     for idx, turns in enumerate(case.sessions):
@@ -198,16 +253,21 @@ async def _ingest_case_sessions(client, case: CompileCase, wait_seconds: float) 
         # 每段对话给不同的会话时间，进一步区分抽取批次。
         session_time_str = base_time.replace(day=base_time.day + idx).isoformat()
         for turn in turns:
+            user_text = turn["user"]
+            assistant_text = turn["assistant"]
+            if template_values:
+                user_text = user_text.format(**template_values)
+                assistant_text = assistant_text.format(**template_values)
             await client.add_message(
                 session_id,
                 role="user",
-                parts=[{"type": "text", "text": turn["user"]}],
+                parts=[{"type": "text", "text": user_text}],
                 options={"created_at": session_time_str},
             )
             await client.add_message(
                 session_id,
                 role="assistant",
-                parts=[{"type": "text", "text": turn["assistant"]}],
+                parts=[{"type": "text", "text": assistant_text}],
                 options={"created_at": session_time_str},
             )
 
@@ -294,6 +354,60 @@ def _render_change_lists(result: dict) -> None:
         console.print(f"  [red]errors: {errors}[/red]")
 
 
+def _entry_uri(entry: dict) -> str:
+    return str(entry.get("uri", ""))
+
+
+async def _verify_rename_case(
+    client,
+    *,
+    case: CompileCase,
+    directory: str,
+    source_uri: str,
+    target_uri: str,
+    task: dict,
+    after: list[dict],
+) -> None:
+    """Verify rename semantics from task diff through persisted content and links."""
+    result = task.get("result") or {}
+    errors = result.get("errors") or []
+    if task.get("status") != "completed" or errors:
+        raise AssertionError(
+            f"rename compile 未成功完成: status={task.get('status')}, errors={errors}"
+        )
+
+    adds = set(result.get("adds") or [])
+    deletes = set(result.get("deletes") or [])
+    if target_uri not in adds or source_uri not in deletes:
+        raise AssertionError(
+            "rename diff 不符合 add(new)+delete(old): "
+            f"expected add={target_uri}, delete={source_uri}, result={result}"
+        )
+
+    after_uris = {_entry_uri(entry) for entry in after}
+    if source_uri in after_uris or target_uri not in after_uris:
+        raise AssertionError(
+            "rename 后目录状态不正确: "
+            f"source_exists={source_uri in after_uris}, target_exists={target_uri in after_uris}"
+        )
+
+    target_content = await client.read(target_uri)
+    missing_facts = [fact for fact in case.required_facts if fact not in target_content]
+    if missing_facts:
+        raise AssertionError(f"英文目标文件丢失事实: {missing_facts}\n{target_content}")
+
+    stale_markers = {source_uri, source_uri.removeprefix("viking://user/")}
+    source_rel = source_uri.removeprefix(directory.rstrip("/") + "/")
+    stale_markers.add(f"entities/{source_rel}")
+    for updated_uri in [target_uri, *(result.get("updates") or [])]:
+        updated_content = await client.read_raw(updated_uri)
+        found_markers = [marker for marker in stale_markers if marker in updated_content]
+        if found_markers:
+            raise AssertionError(f"关系迁移后仍残留旧 URI/href: {updated_uri} -> {found_markers}")
+
+    console.print(f"  [bold green]rename 验证通过:[/bold green] {source_uri} → {target_uri}")
+
+
 # ── Phase 2: 触发 memory compile 并轮询 ─────────────────────────────────────
 
 
@@ -340,18 +454,46 @@ async def _run_memory_compile(client, directory: str, instruction: str) -> dict:
 async def _run_case(client, args, case: CompileCase) -> None:
     """跑单个 compile case：种子对话 → 整理前快照 → compile → 整理后对比。"""
     directory = args.to or _memory_dir(args.user, case.memory_type)
+    source_name = None
+    target_name = None
+    instruction = case.instruction
+    if case.rename_target_prefix:
+        source_name, target_name = _unique_rename_names(case)
+        instruction = instruction.format(source_name=source_name, target_name=target_name)
 
     console.rule(f"[bold magenta]CASE: {case.key} — {case.description}[/bold magenta]")
 
     console.rule(f"[bold]Phase 0b: 种子对话 case={case.key}[/bold]")
-    await _ingest_case_sessions(client, case, wait_seconds=args.wait)
+    await _ingest_case_sessions(
+        client,
+        case,
+        wait_seconds=args.wait,
+        template_values={"source_name": source_name, "target_name": target_name}
+        if source_name and target_name
+        else None,
+    )
 
     console.rule(f"[bold]Phase 1: 整理前 — {directory}[/bold]")
     before = await _snapshot_memory_dir(client, directory)
     _render_snapshot("整理前", directory, before)
+    source_uri = None
+    target_uri = None
+    if source_name and target_name:
+        source_suffix = f"/{source_name}.md"
+        matching_sources = [
+            _entry_uri(entry) for entry in before if _entry_uri(entry).endswith(source_suffix)
+        ]
+        if len(matching_sources) != 1:
+            raise AssertionError(
+                f"rename case 需要恰好一个中文源文件 *{source_suffix}，实际: {matching_sources}"
+            )
+        source_uri = matching_sources[0]
+        target_uri = f"{directory.rstrip('/')}/person/{target_name}.md"
+        if target_uri in {_entry_uri(entry) for entry in before}:
+            raise AssertionError(f"动态英文目标 URI 意外已存在: {target_uri}")
 
     console.rule("[bold]Phase 2: 执行 memory compile[/bold]")
-    task = await _run_memory_compile(client, directory, case.instruction)
+    task = await _run_memory_compile(client, directory, instruction)
 
     result = task.get("result") or {}
     trace_id = result.get("trace_id") or task.get("trace_id") or ""
@@ -371,6 +513,17 @@ async def _run_case(client, args, case: CompileCase) -> None:
     console.rule(f"[bold]Phase 3: 整理后 — {directory}[/bold]")
     after = await _snapshot_memory_dir(client, directory)
     _render_snapshot("整理后", directory, after)
+
+    if source_uri and target_uri:
+        await _verify_rename_case(
+            client,
+            case=case,
+            directory=directory,
+            source_uri=source_uri,
+            target_uri=target_uri,
+            task=task,
+            after=after,
+        )
 
     console.print()
     console.print(
@@ -417,6 +570,7 @@ async def _main_async(args) -> None:
         import traceback
 
         traceback.print_exc()
+        raise
 
     finally:
         await client.close()
@@ -452,7 +606,8 @@ def main():
         help=(
             "compile 集成 case（默认: all，依次跑全部）。"
             "merge=合并两个同人不同称呼；split=拆分同名两人；"
-            "dedup=原地精简重复表述；preferences=整理 preferences 类型。"
+            "dedup=原地精简重复表述；rename=中文文件名迁移为英文；"
+            "preferences=整理 preferences 类型。"
         ),
     )
     parser.add_argument(
