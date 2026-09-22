@@ -1339,8 +1339,91 @@ class TestMemoryUpdater:
     async def test_apply_operations_explicit_merge_to_existing_target_is_allowed(self):
         source_uri = "viking://user/u/memories/entities/person/阿珍.md"
         target_uri = "viking://user/u/memories/entities/person/陈静娴.md"
-        source_file = MemoryFile(uri=source_uri, memory_type="entities", content="source")
+        event_uri = "viking://user/u/memories/events/2023/04/09/loan.md"
+        event_link = {
+            "from_uri": event_uri,
+            "to_uri": source_uri,
+            "link_type": "related_to",
+            "weight": 0.8,
+            "match_text": "阿珍",
+            "description": "source link",
+        }
+        source_file = MemoryFile(
+            uri=source_uri,
+            memory_type="entities",
+            content="source",
+            backlinks=[event_link],
+        )
+        event_file = MemoryFile(
+            uri=event_uri,
+            memory_type="events",
+            content=(
+                "[阿珍](../../../../entities/person/阿珍.md) helped. "
+                "[docs](https://example.com/docs) and [notes](./notes.md)."
+            ),
+            links=[event_link],
+        )
+        target_file = MemoryFile(uri=target_uri, memory_type="entities", content="merged")
+        store = {
+            source_uri: MemoryFileUtils.write(source_file),
+            target_uri: MemoryFileUtils.write(target_file),
+            event_uri: MemoryFileUtils.write(event_file, render_links=False),
+        }
+        mock_viking_fs = MagicMock()
+
+        async def read_file(uri, **kwargs):
+            return store[uri]
+
+        async def write_file(uri, content, **kwargs):
+            store[uri] = content
+
+        mock_viking_fs.read_file = AsyncMock(side_effect=read_file)
+        mock_viking_fs.write_file = AsyncMock(side_effect=write_file)
+        updater = MemoryUpdater(registry=MagicMock())
+        updater._get_viking_fs = MagicMock(return_value=mock_viking_fs)
+        updater._apply_upsert = AsyncMock()
+        updater._apply_delete = AsyncMock()
+        updater._sync_resource_refs_for_result = AsyncMock()
+        updater._vectorize_memories = AsyncMock()
+        updater.generate_overview = AsyncMock()
+        operations = ResolvedOperations(
+            upsert_operations=[
+                ResolvedOperation(
+                    old_memory_file_content=target_file,
+                    memory_fields={"content": "merged"},
+                    memory_type="entities",
+                    uris=[target_uri],
+                )
+            ],
+            delete_file_contents=[source_file],
+            delete_replacements={source_uri: target_uri},
+            errors=[],
+        )
+
+        ctx = MagicMock()
+        result = await updater.apply_operations(operations, ctx)
+
+        assert result.edited_uris == [target_uri, event_uri]
+        assert result.deleted_uris == [source_uri]
+        target = MemoryFileUtils.read(store[target_uri], uri=target_uri)
+        assert target.backlinks[0]["from_uri"] == event_uri
+        assert target.backlinks[0]["to_uri"] == target_uri
+        event = MemoryFileUtils.read(store[event_uri], uri=event_uri)
+        assert event.links[0]["from_uri"] == event_uri
+        assert event.links[0]["to_uri"] == target_uri
+        assert "../../../../entities/person/阿珍.md" not in event.content
+        assert "[阿珍](../../../../entities/person/陈静娴.md)" in event.content
+        assert "[docs](https://example.com/docs)" in event.content
+        assert "[notes](./notes.md)" in event.content
+        updater._apply_upsert.assert_awaited_once()
+        updater._apply_delete.assert_awaited_once_with(source_uri, ctx, lease_ref=None)
+
+    @pytest.mark.asyncio
+    async def test_apply_operations_explicit_merge_inherits_source_forward_links(self):
+        source_uri = "viking://user/u/memories/entities/person/阿珍.md"
+        target_uri = "viking://user/u/memories/entities/person/陈静娴.md"
         profile_uri = "viking://user/u/memories/profile.md"
+        source_file = MemoryFile(uri=source_uri, memory_type="entities", content="source")
         source_file.links = [
             {
                 "from_uri": source_uri,

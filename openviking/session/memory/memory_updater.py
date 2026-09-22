@@ -1405,8 +1405,14 @@ class MemoryUpdater:
 
             metadata: Dict[str, Any] = {}
             if is_uri_migration:
+                from openviking.session.memory.utils.link_renderer import LinkRenderer
+
                 metadata.update(old_content.extra_fields)
-                metadata["content"] = old_content.plain_content()
+                metadata["content"] = LinkRenderer.strip_managed_links(
+                    old_content.content,
+                    old_content.uri,
+                    old_content.links,
+                )
             metadata.update(resolved_op.memory_fields)
             source = getattr(resolved_op, "source", None)
             source_extraction_id = getattr(source, "extraction_id", None) if source else None
@@ -1658,6 +1664,9 @@ class MemoryUpdater:
                 if not content:
                     continue
                 mf = MemoryFileUtils.read(content, uri=uri)
+                from openviking.session.memory.utils.link_renderer import LinkRenderer
+
+                plain_content = LinkRenderer.strip_managed_links(mf.content, uri, mf.links)
                 # Remapped links have different dedup keys, so remove the old
                 # endpoints before merging to avoid retaining dangling aliases.
                 mf.links = [
@@ -1679,6 +1688,7 @@ class MemoryUpdater:
                 current_trace_id = get_trace_id()
                 if current_trace_id:
                     mf.extra_fields["last_update_trace_id"] = current_trace_id
+                mf.content = plain_content
                 bump_memory_version(mf)
                 await viking_fs.write_file(
                     uri,
