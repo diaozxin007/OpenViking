@@ -1945,8 +1945,14 @@ class MemoryUpdater:
                     ctx=ctx,
                     lease_ref=lease_ref,
                 )
-            except Exception:
+            except (NotFoundError, FileNotFoundError):
                 pass
+            except Exception:
+                logger.warning(
+                    "Failed to delete empty memory overview %s",
+                    overview_path,
+                    exc_info=True,
+                )
             # Try to delete empty directory
             if can_delete_directory:
                 try:
@@ -1956,8 +1962,14 @@ class MemoryUpdater:
                         ctx=ctx,
                         lease_ref=lease_ref,
                     )
-                except Exception:
+                except (NotFoundError, FileNotFoundError):
                     pass
+                except Exception:
+                    logger.warning(
+                        "Failed to delete empty memory directory %s",
+                        directory,
+                        exc_info=True,
+                    )
             return True
 
         # Parse each file and collect items

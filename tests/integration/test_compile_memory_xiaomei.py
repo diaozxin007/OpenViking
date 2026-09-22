@@ -540,6 +540,15 @@ async def _run_rename_round_trip(
         instruction=to_english,
     )
 
+    chinese_directory = chinese_uri.rpartition("/")[0]
+    try:
+        await client.stat(chinese_directory)
+    except Exception as exc:
+        if getattr(exc, "code", None) != "NOT_FOUND":
+            raise
+    else:
+        raise AssertionError(f"中文源目录在最后一个文件迁出后仍然存在: {chinese_directory}")
+
     console.rule(f"[bold]Rename round trip 最终状态 — {directory}[/bold]")
     _render_snapshot("往返改名后", directory, final)
     console.print(
@@ -548,6 +557,7 @@ async def _run_rename_round_trip(
             f"[bold]初始 URI:[/bold] {initial_uri}\n"
             f"[bold]英文 URI:[/bold] {english_uri}\n"
             f"[bold]中文 URI:[/bold] {chinese_uri}\n"
+            f"[bold]中文目录清理:[/bold] {chinese_directory} 已删除\n"
             "[bold green]往返三步全部验证通过[/bold green]",
             title="对比 — rename round trip",
             style="magenta",

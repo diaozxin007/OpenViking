@@ -2135,6 +2135,29 @@ def _operation_lock_paths(
     return _uri_lock_paths(uris, viking_fs, ctx)
 
 
+def _operation_tree_lock_paths(
+    operations: ResolvedOperations,
+    viking_fs: Any | None,
+    ctx: RequestContext,
+) -> list[str]:
+    """Lock old parent directories that may become empty after URI migration."""
+    directories: set[str] = set()
+    for source_uri, target_uri in dict(operations.delete_replacements or {}).items():
+        source_directory = str(source_uri).rstrip("/").rpartition("/")[0]
+        target_directory = str(target_uri).rstrip("/").rpartition("/")[0]
+        if source_directory and source_directory != target_directory:
+            directories.add(source_directory)
+    return _uri_lock_paths(directories, viking_fs, ctx)
+
+
+def _exclude_tree_covered_paths(exact_paths: set[str], tree_paths: set[str]) -> set[str]:
+    return {
+        path
+        for path in exact_paths
+        if not any(path == tree or path.startswith(f"{tree.rstrip('/')}/") for tree in tree_paths)
+    }
+
+
 async def _persisted_replacement_relation_uris(
     operations: ResolvedOperations,
     viking_fs: Any,
@@ -2172,32 +2195,44 @@ async def acquire_memory_operation_lease(
     # this before second-stage patch merging would present the same rename as
     # both an update patch and a delete patch.
     MemoryUpdater._materialize_uri_migrations(operations)
-    lock_paths = _operation_lock_paths(operations, viking_fs, ctx)
-    if not lock_paths:
+    exact_paths = set(_operation_lock_paths(operations, viking_fs, ctx))
+    tree_paths = set(_operation_tree_lock_paths(operations, viking_fs, ctx))
+    exact_paths = _exclude_tree_covered_paths(exact_paths, tree_paths)
+    if not exact_paths and not tree_paths:
         return None
 
-    required_paths = set(lock_paths)
+    required_exact_paths = set(exact_paths)
     for acquisition in range(1, _MEMORY_APPLY_LOCK_MAX_ACQUISITIONS + 1):
-        lease = await viking_fs._async_agfs.pathlock_acquire_exact_batch(
-            sorted(required_paths),
-            timeout_secs=_MEMORY_APPLY_LOCK_TIMEOUT_SECONDS,
-        )
+        if tree_paths:
+            lease = await viking_fs._async_agfs.pathlock_acquire_exact_tree_batch(
+                sorted(required_exact_paths),
+                sorted(tree_paths),
+                timeout_secs=_MEMORY_APPLY_LOCK_TIMEOUT_SECONDS,
+            )
+        else:
+            lease = await viking_fs._async_agfs.pathlock_acquire_exact_batch(
+                sorted(required_exact_paths),
+                timeout_secs=_MEMORY_APPLY_LOCK_TIMEOUT_SECONDS,
+            )
         try:
             relation_uris = await _persisted_replacement_relation_uris(
                 operations,
                 viking_fs,
                 ctx,
             )
-            expanded_paths = required_paths | set(_uri_lock_paths(relation_uris, viking_fs, ctx))
+            expanded_exact_paths = required_exact_paths | set(
+                _uri_lock_paths(relation_uris, viking_fs, ctx)
+            )
+            expanded_exact_paths = _exclude_tree_covered_paths(expanded_exact_paths, tree_paths)
         except BaseException:
             await viking_fs._async_agfs.pathlock_release(lease)
             raise
 
-        if expanded_paths == required_paths:
+        if expanded_exact_paths == required_exact_paths:
             return lease
 
         await viking_fs._async_agfs.pathlock_release(lease)
-        required_paths = expanded_paths
+        required_exact_paths = expanded_exact_paths
         if acquisition == _MEMORY_APPLY_LOCK_MAX_ACQUISITIONS:
             raise RuntimeError(
                 "Unable to stabilize memory apply lock coverage after "

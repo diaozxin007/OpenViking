@@ -31,6 +31,7 @@ from openviking.session.memory.streaming_memory_updater import (
     StreamingMemoryUpdater,
     StreamingMemoryUpdaterConfig,
     StreamingMemoryUpdateResult,
+    acquire_memory_operation_lease,
     classify_memory_merge_mode,
     enforce_merge_group_peer_id,
     get_streaming_memory_updater,
@@ -124,6 +125,11 @@ class RecordingPathlockClient:
         )
         lease = {"lease_ref": lease_ref}
         self.events.append(("acquire", tuple(paths), timeout_secs))
+        return lease
+
+    async def pathlock_acquire_exact_tree_batch(self, exact_paths, tree_paths, timeout_secs=0.0):
+        lease = {"lease_ref": "memory-mixed-lease"}
+        self.events.append(("acquire_mixed", tuple(exact_paths), tuple(tree_paths), timeout_secs))
         return lease
 
     async def pathlock_release(self, lease):
@@ -426,6 +432,72 @@ async def test_streaming_apply_migrates_uri_under_one_stable_lease(monkeypatch):
     lease = {"lease_ref": "memory-batch-lease"}
     assert all(event[2] == lease for event in fs.events if event[0] == "write")
     assert fs.events[-1] == ("release", lease)
+
+
+async def test_cross_directory_migration_tree_locks_old_parent():
+    source_uri = "viking://user/u/memories/entities/人物/小美.md"
+    target_uri = "viking://user/u/memories/entities/person/xiaomei.md"
+    old_file = MemoryFile(
+        uri=source_uri,
+        content="小美",
+        memory_type="entities",
+        extra_fields={"category": "人物", "name": "小美"},
+    )
+    fs = PathlockedInMemoryVikingFS({source_uri: MemoryFileUtils.write(old_file)})
+    operations = ResolvedOperations(
+        upsert_operations=[
+            ResolvedOperation(
+                old_memory_file_content=old_file,
+                memory_type="entities",
+                uris=[target_uri],
+                memory_fields={"category": "person", "name": "xiaomei"},
+            )
+        ],
+        delete_file_contents=[],
+        errors=[],
+    )
+
+    lease = await acquire_memory_operation_lease(operations, fs, _ctx())
+
+    source_directory_path = "/user/u/memories/entities/人物"
+    target_file_path = "/user/u/memories/entities/person/xiaomei.md"
+    mixed = next(event for event in fs.events if event[0] == "acquire_mixed")
+    assert mixed[2] == (source_directory_path,)
+    assert target_file_path in mixed[1]
+    assert not any(path.startswith(f"{source_directory_path}/") for path in mixed[1])
+    assert lease == {"lease_ref": "memory-mixed-lease"}
+
+
+async def test_same_directory_migration_keeps_exact_locks():
+    source_uri = "viking://user/u/memories/entities/person/小美.md"
+    target_uri = "viking://user/u/memories/entities/person/xiaomei.md"
+    old_file = MemoryFile(
+        uri=source_uri,
+        content="小美",
+        memory_type="entities",
+        extra_fields={"category": "person", "name": "小美"},
+    )
+    fs = PathlockedInMemoryVikingFS({source_uri: MemoryFileUtils.write(old_file)})
+    operations = ResolvedOperations(
+        upsert_operations=[
+            ResolvedOperation(
+                old_memory_file_content=old_file,
+                memory_type="entities",
+                uris=[target_uri],
+                memory_fields={"category": "person", "name": "xiaomei"},
+            )
+        ],
+        delete_file_contents=[],
+        errors=[],
+    )
+
+    lease = await acquire_memory_operation_lease(operations, fs, _ctx())
+
+    assert not any(event[0] == "acquire_mixed" for event in fs.events)
+    exact = next(event for event in fs.events if event[0] == "acquire")
+    assert "/user/u/memories/entities/person/小美.md" in exact[1]
+    assert "/user/u/memories/entities/person/xiaomei.md" in exact[1]
+    assert lease == {"lease_ref": "memory-batch-lease"}
 
 
 async def test_operation_to_patch_skips_failed_field_preview_update():
