@@ -2,8 +2,9 @@
 """
 OpenViking memory-mode compile 集成脚本 — 用户: 小美
 
-用 `--skill memory` 对某个记忆类型目录做「就地整理」（dedup/merge/reorganize），
-产物严格遵守该记忆类型的 schema。脚本流程：
+默认跑全部单类型和 memories 根目录用例，产物遵守各自 schema。
+rename 和 memory_root 直接创建唯一测试文件，其余用例通过种子对话抽取；测试数据保留，不自动清理。
+脚本流程：
 
   Phase 0 (可选 --ingest): 复用小美对话灌一遍数据，产生 entities 等记忆
   Phase 1: 打印整理前该目录下的记忆文件
@@ -14,8 +15,7 @@ OpenViking memory-mode compile 集成脚本 — 用户: 小美
   python tests/integration/test_compile_memory_xiaomei.py --url http://localhost:1933
   python tests/integration/test_compile_memory_xiaomei.py --url http://localhost:1933 --ingest
   python tests/integration/test_compile_memory_xiaomei.py --url http://localhost:1933 \
-      --to viking://user/xiaomei/memories/entities \
-      --instruction "合并重复实体，但不同实体不要合并"
+      --case memory_root --no-ingest
 """
 
 import argparse
@@ -24,6 +24,7 @@ import time
 import uuid
 from dataclasses import dataclass
 from datetime import datetime
+from posixpath import relpath
 
 from rich import box
 from rich.console import Console
@@ -31,6 +32,8 @@ from rich.panel import Panel
 from rich.table import Table
 
 import openviking as ov
+from openviking.session.memory.dataclass import MemoryFile, StoredLink
+from openviking.session.memory.utils.memory_file_utils import MemoryFileUtils
 
 try:
     from openviking_live_auth import API_KEY_HELP, resolve_api_key
@@ -62,11 +65,10 @@ class CompileCase:
     """
 
     key: str
-    memory_type: str
+    memory_type: str | None
     instruction: str
     sessions: list[list[dict]]
     description: str
-    rename_source_prefix: str | None = None
     rename_target_prefix: str | None = None
     required_facts: tuple[tuple[str, ...], ...] = ()
 
@@ -149,8 +151,6 @@ CASE_DEDUP = CompileCase(
     description="同一实体反复重复陈述，compile 原地精简（update，文件变小）。",
 )
 
-# D. 改名（rename）：先抽取中文实体名，再由 compile 修改 URI identity fields，
-# 验证表现为 add 英文 URI + delete 中文 URI，同时保留全部事实与关系链接。
 CASE_RENAME = CompileCase(
     key="rename",
     memory_type="entities",
@@ -159,23 +159,10 @@ CASE_RENAME = CompileCase(
         " {target_name}.md。保留摄影老师、杭州、风光摄影和十月去西湖练习长曝光等事实；"
         "不要创建重复实体或修改其他实体。"
     ),
-    sessions=[
-        [
-            {
-                "user": (
-                    "我的摄影老师叫{source_name}，她住在杭州，专门拍风光摄影。"
-                    "她十月会带我去西湖练习长曝光。"
-                ),
-                "assistant": (
-                    "{source_name}老师的风光摄影经验很丰富，十月去西湖练习长曝光很值得期待。"
-                ),
-            }
-        ]
-    ],
+    sessions=[],
     description=(
         "目录和文件名在中英文之间往返改名，每一步均为 add 新 URI + delete 旧 URI，并迁移关系链接。"
     ),
-    rename_source_prefix="罗晴",
     rename_target_prefix="photo_teacher",
     required_facts=(
         ("摄影老师", "photography teacher"),
@@ -212,19 +199,51 @@ CASE_PREFERENCES = CompileCase(
     description="整理 preferences 类型，验证 compile 对非 entities schema 同样工作。",
 )
 
+CASE_MEMORY_ROOT = CompileCase(
+    key="memory_root",
+    memory_type=None,
+    instruction=(
+        "请在这次整理中同时完成两件事：把人物「{source_name}」的文件名改为 {target_name}.md，"
+        "仍放在 person 目录，保留她是苏州陶艺老师、教授青瓷拉坯的事实；"
+        "把「{topic}」这条偏好原地精简，删除重复表述，保留喜欢小班课、"
+        "每班最多六人、方便老师逐个指导以及喜欢{source_name}老师课程的事实。"
+        "保留课程资料链接，不要删除偏好，不要修改其它记忆，也不要合并不同的人。"
+    ),
+    sessions=[],
+    description="一次 memories 根目录 compile 同时改名实体和精简偏好，验证根目录文件与跨类型链接。",
+    required_facts=(
+        ("陶艺老师", "pottery teacher", "ceramics teacher"),
+        ("苏州", "suzhou"),
+        ("青瓷", "celadon"),
+        ("拉坯", "wheel throwing", "wheel-throwing"),
+    ),
+)
+
+
 CASES: dict[str, CompileCase] = {
     CASE_MERGE.key: CASE_MERGE,
     CASE_SPLIT.key: CASE_SPLIT,
     CASE_DEDUP.key: CASE_DEDUP,
     CASE_RENAME.key: CASE_RENAME,
     CASE_PREFERENCES.key: CASE_PREFERENCES,
+    CASE_MEMORY_ROOT.key: CASE_MEMORY_ROOT,
 }
 
 console = Console()
 
 
-def _memory_dir(user: str, memory_type: str) -> str:
-    return f"viking://user/{user}/memories/{memory_type}"
+def _memory_dir(user: str, memory_type: str | None) -> str:
+    root = f"viking://user/{user}/memories"
+    return f"{root}/{memory_type}" if memory_type else root
+
+
+def _case_directory(args, case: CompileCase) -> str:
+    directory = (args.to or _memory_dir(args.user, case.memory_type)).rstrip("/")
+    if case.key == "memory_root" and directory != _memory_dir(args.user, None):
+        raise ValueError("memory_root 用例的 --to 必须是当前用户的 memories 根目录")
+    if case.rename_target_prefix and directory.rsplit("/", 1)[-1] != "entities":
+        raise ValueError("rename 用例的 --to 必须是 entities 目录，不能直接传 memories 根目录")
+    return directory
 
 
 def _unique_rename_names(case: CompileCase) -> tuple[str, str]:
@@ -250,7 +269,6 @@ async def _ingest_case_sessions(
     client,
     case: CompileCase,
     wait_seconds: float,
-    template_values: dict[str, str] | None = None,
 ) -> None:
     """为 case 的每段对话独立开 session 并 commit，让抽取各自产出实体。"""
     base_time = datetime(2023, 4, 9, 20, 0)
@@ -264,9 +282,6 @@ async def _ingest_case_sessions(
         for turn in turns:
             user_text = turn["user"]
             assistant_text = turn["assistant"]
-            if template_values:
-                user_text = user_text.format(**template_values)
-                assistant_text = assistant_text.format(**template_values)
             await client.add_message(
                 session_id,
                 role="user",
@@ -284,13 +299,16 @@ async def _ingest_case_sessions(
         commit_result = await client.commit_session(session_id)
         task_id = commit_result.get("task_id")
         console.print(f"  [bold cyan]trace_id: {commit_result.get('trace_id')}[/bold cyan]")
-        if task_id:
-            while True:
-                task = await client.get_task(task_id)
-                if not task or task.get("status") in ("completed", "failed"):
-                    break
-                await asyncio.sleep(1)
-            console.print(f"  [green]抽取 {task.get('status') if task else 'unknown'}[/green]")
+        if not task_id:
+            raise AssertionError(f"种子对话提交未返回 task_id: {commit_result}")
+        while True:
+            task = await client.get_task(task_id)
+            if not task or task.get("status") in ("completed", "failed", "cancelled"):
+                break
+            await asyncio.sleep(1)
+        if not task or task.get("status") != "completed" or task.get("error"):
+            raise AssertionError(f"种子对话抽取失败: {task}")
+        console.print("  [green]抽取 completed[/green]")
         await client.wait_processed()
     if wait_seconds > 0:
         await asyncio.sleep(wait_seconds)
@@ -302,17 +320,15 @@ async def _ingest_case_sessions(
 async def _snapshot_memory_dir(client, directory: str) -> list[dict]:
     """递归列出某记忆目录下的 .md 文件（跳过 .overview.md / .abstract.md）。"""
     files: list[dict] = []
-    try:
-        entries = await client.ls(
-            directory,
-            recursive=True,
-            output="original",
-            show_all_hidden=False,
-            node_limit=1000,
-        )
-    except Exception as e:
-        console.print(f"    [red]列目录失败 {directory}: {e}[/red]")
-        return files
+    entries = await client.ls(
+        directory,
+        recursive=True,
+        output="original",
+        show_all_hidden=False,
+        node_limit=1000,
+    )
+    if len(entries or []) >= 1000:
+        raise AssertionError(f"目录快照可能被截断，无法完整验证: {directory}")
 
     for entry in entries or []:
         if not isinstance(entry, dict):
@@ -376,6 +392,7 @@ async def _verify_rename_case(
     target_uri: str,
     task: dict,
     after: list[dict],
+    event_uri: str,
 ) -> None:
     """Verify rename semantics from task diff through persisted content and links."""
     result = task.get("result") or {}
@@ -419,26 +436,63 @@ async def _verify_rename_case(
         if found_markers:
             raise AssertionError(f"关系迁移后仍残留旧 URI/href: {updated_uri} -> {found_markers}")
 
+    event = MemoryFileUtils.read(await client.read_raw(event_uri), uri=event_uri)
+    target = MemoryFileUtils.read(await client.read_raw(target_uri), uri=target_uri)
+    migrated_links = [link for link in event.links if link.get("to_uri") == target_uri]
+    if event_uri not in (result.get("updates") or []) or not migrated_links:
+        raise AssertionError(f"关联事件未更新到新实体: {event_uri}")
+    if not all(link in target.backlinks for link in migrated_links):
+        raise AssertionError(f"新实体缺少关联事件 backlink: {target_uri}")
+    href = relpath(target_uri, event_uri.rpartition("/")[0])
+    if f"]({href})" not in event.content:
+        raise AssertionError(f"关联事件正文缺少新 URI 链接: {event_uri}")
     console.print(f"  [bold green]rename 验证通过:[/bold green] {source_uri} → {target_uri}")
 
 
-async def _find_entity_uri_by_content(
-    client, directory: str, files: list[dict], source_name: str
-) -> str:
-    candidates = []
-    for entry in files:
-        uri = _entry_uri(entry)
-        relative_uri = uri.removeprefix(directory.rstrip("/") + "/")
-        if not relative_uri.startswith(("person/", "人物/")):
-            continue
-        content = await client.read(uri)
-        if source_name in content:
-            candidates.append(uri)
-    if len(candidates) != 1:
-        raise AssertionError(
-            f"rename case 需要按内容找到恰好一个人物「{source_name}」，实际: {candidates}"
-        )
-    return candidates[0]
+async def _seed_rename_case(
+    client,
+    directory: str,
+    source_name: str,
+    english_name: str,
+) -> tuple[str, str]:
+    source_uri = f"{directory}/person/{source_name}.md"
+    event_name = f"photography_plan_{english_name}"
+    event_uri = f"{directory.rpartition('/')[0]}/events/2023/04/09/{event_name}.md"
+    link = StoredLink(
+        from_uri=event_uri,
+        to_uri=source_uri,
+        match_text=source_name,
+        description="摄影课程的授课老师",
+    ).model_dump()
+    entity = MemoryFile(
+        uri=source_uri,
+        memory_type="entities",
+        extra_fields={"memory_type": "entities", "category": "person", "name": source_name},
+        content=(
+            f"# {source_name}\n她是小美的摄影老师。\n\n## 专业\n- 住在杭州。\n"
+            "- 专门拍风光摄影。\n\n## 课程\n- 十月带小美去西湖练习长曝光。"
+        ),
+        backlinks=[link],
+    )
+    summary = f"{source_name}老师十月带小美去西湖练习长曝光。"
+    event = MemoryFile(
+        uri=event_uri,
+        memory_type="events",
+        extra_fields={
+            "memory_type": "events",
+            "event_name": event_name,
+            "goal": "photography lessons",
+            "summary": summary,
+            "ranges": "0",
+        },
+        content=f"# Summary\n{summary}\n",
+        links=[link],
+    )
+    # Session extraction may translate names before the rename test starts.
+    for memory in (entity, event):
+        await client.write(memory.uri, MemoryFileUtils.write(memory), mode="create", wait=True)
+    await client.wait_processed()
+    return source_uri, event_uri
 
 
 async def _run_rename_step(
@@ -451,6 +505,7 @@ async def _run_rename_step(
     source_uri: str,
     target_uri: str,
     instruction: str,
+    event_uri: str,
 ) -> list[dict]:
     console.rule(f"[bold]Rename {label}: {source_uri} → {target_uri}[/bold]")
     before = await _snapshot_memory_dir(client, directory)
@@ -480,6 +535,7 @@ async def _run_rename_step(
         target_uri=target_uri,
         task=task,
         after=after,
+        event_uri=event_uri,
     )
     return after
 
@@ -492,9 +548,9 @@ async def _run_rename_round_trip(
     directory: str,
     source_name: str,
     english_name: str,
-    initial: list[dict],
+    initial_uri: str,
+    event_uri: str,
 ) -> None:
-    initial_uri = await _find_entity_uri_by_content(client, directory, initial, source_name)
     english_uri = f"{directory.rstrip('/')}/person/{english_name}.md"
     chinese_uri = f"{directory.rstrip('/')}/人物/{source_name}.md"
 
@@ -511,6 +567,7 @@ async def _run_rename_round_trip(
         source_uri=initial_uri,
         target_uri=english_uri,
         instruction=to_english,
+        event_uri=event_uri,
     )
 
     to_chinese = (
@@ -527,6 +584,7 @@ async def _run_rename_round_trip(
         source_uri=english_uri,
         target_uri=chinese_uri,
         instruction=to_chinese,
+        event_uri=event_uri,
     )
 
     final = await _run_rename_step(
@@ -538,6 +596,7 @@ async def _run_rename_round_trip(
         source_uri=chinese_uri,
         target_uri=english_uri,
         instruction=to_english,
+        event_uri=event_uri,
     )
 
     chinese_directory = chinese_uri.rpartition("/")[0]
@@ -566,6 +625,196 @@ async def _run_rename_round_trip(
     )
 
 
+def _memory_root_seed_files(root: str, user: str, token: str) -> tuple[MemoryFile, MemoryFile, str]:
+    name = f"陶艺老师林澄_{token}"
+    source_uri = f"{root}/entities/person/{name}.md"
+    target_uri = f"{root}/entities/person/pottery_teacher_{token}.md"
+    topic = f"pottery_class_{token}"
+    preference_uri = f"{root}/preferences/{user}/{topic}.md"
+    link = StoredLink(
+        from_uri=preference_uri,
+        to_uri=source_uri,
+        match_text=name,
+        description="偏好课程的授课老师",
+    ).model_dump()
+    entity = MemoryFile(
+        uri=source_uri,
+        memory_type="entities",
+        extra_fields={"memory_type": "entities", "category": "person", "name": name},
+        content=f"# {name}\n她是住在苏州的陶艺老师。\n\n## 专业\n- 教授青瓷拉坯。\n\n## 关系\n- 为小美授课。",
+        backlinks=[link],
+    )
+    preference = MemoryFile(
+        uri=preference_uri,
+        memory_type="preferences",
+        extra_fields={"memory_type": "preferences", "user": user, "topic": topic},
+        content=(
+            f"- 喜欢{name}老师的陶艺小班课，每班最多六人，方便老师逐个指导。\n" * 8
+            + "- [课程资料](https://example.com/docs)\n"
+        ),
+        links=[link],
+    )
+    return entity, preference, target_uri
+
+
+async def _run_memory_root_case(client, args, case: CompileCase, root: str) -> None:
+    console.rule(f"[bold magenta]CASE: {case.key} — {case.description}[/bold magenta]")
+    entity, preference, target_uri = _memory_root_seed_files(root, args.user, uuid.uuid4().hex[:8])
+    for memory in (entity, preference):
+        await client.write(memory.uri, MemoryFileUtils.write(memory), mode="create", wait=True)
+
+    profile_uri = f"{root}/profile.md"
+    try:
+        await client.stat(profile_uri)
+    except Exception as exc:
+        if getattr(exc, "code", None) != "NOT_FOUND":
+            raise
+        profile = MemoryFile(
+            uri=profile_uri,
+            memory_type="profile",
+            extra_fields={"memory_type": "profile"},
+            content=f"# {DISPLAY_NAME}\n- 姓名：{DISPLAY_NAME} (as of 2023-04-09)\n",
+        )
+        await client.write(profile_uri, MemoryFileUtils.write(profile), mode="create", wait=True)
+    await client.wait_processed()
+    before_files = await _snapshot_memory_dir(client, root)
+    before = {_entry_uri(entry): await client.read_raw(_entry_uri(entry)) for entry in before_files}
+    _render_snapshot("根目录整理前", root, before_files)
+    instruction = case.instruction.format(
+        source_name=entity.extra_fields["name"],
+        target_name=target_uri.rsplit("/", 1)[-1].removesuffix(".md"),
+        topic=preference.extra_fields["topic"],
+    )
+    console.print(f"  instruction: {instruction}")
+    task = await _run_memory_compile(client, root, instruction)
+    _render_change_lists(task["result"])
+    await client.wait_processed()
+    if args.wait > 0:
+        await asyncio.sleep(args.wait)
+    after_files = await _snapshot_memory_dir(client, root)
+    after = {_entry_uri(entry): await client.read_raw(_entry_uri(entry)) for entry in after_files}
+    _verify_memory_root_case(
+        root=root,
+        source_uri=entity.uri,
+        target_uri=target_uri,
+        preference_uri=preference.uri,
+        task=task,
+        before=before,
+        after=after,
+    )
+    _render_snapshot("根目录整理后", root, after_files)
+    console.print(
+        Panel(
+            f"task_id: {task.get('task_id')}\n"
+            f"memory_types: {task['result']['memory_types']}\n"
+            f"实体: {entity.uri} → {target_uri}\n偏好: {preference.uri} 原地精简\n"
+            "单次根目录 compile 验证通过：两种类型实际变更、profile 纳入范围、事实和链接保留。",
+            title="对比 — memory_root",
+            width=PANEL_WIDTH,
+        )
+    )
+
+
+def _verify_memory_root_case(
+    *,
+    root: str,
+    source_uri: str,
+    target_uri: str,
+    preference_uri: str,
+    task: dict,
+    before: dict[str, str],
+    after: dict[str, str],
+) -> None:
+    result = task.get("result") or {}
+    if task.get("status") != "completed" or task.get("error") or result.get("errors"):
+        raise AssertionError(f"memory_root compile 未成功完成: {task}")
+    if result.get("to") != root or result.get("memory_type") is not None:
+        raise AssertionError(f"未按 memories 根目录整理: {result}")
+    required_types = {"entities", "preferences", "profile"}
+    if not required_types.issubset(set(result.get("memory_types") or [])):
+        raise AssertionError(f"根目录未纳入所需类型: {result.get('memory_types')}")
+    for kind, expected in (
+        ("adds", {target_uri}),
+        ("deletes", {source_uri}),
+        ("updates", {preference_uri}),
+    ):
+        if set(result.get(kind) or []) != expected or result.get(f"total_{kind}") != len(expected):
+            raise AssertionError(f"根目录 {kind} 不符合预期: {result}")
+    if (
+        source_uri not in before
+        or target_uri in before
+        or preference_uri not in before
+        or f"{root}/profile.md" not in before
+    ):
+        raise AssertionError("memory_root 前置文件不完整或改名目标已存在")
+    if set(after) != (set(before) - {source_uri}) | {target_uri}:
+        raise AssertionError("根目录文件集合不符合预期，可能误删或新增了其它记忆")
+    for uri, raw in before.items():
+        if uri not in {source_uri, preference_uri} and after[uri] != raw:
+            raise AssertionError(f"根目录整理修改了非目标记忆: {uri}")
+
+    entity = MemoryFileUtils.read(after[target_uri], uri=target_uri)
+    preference = MemoryFileUtils.read(after[preference_uri], uri=preference_uri)
+    old_preference = MemoryFileUtils.read(before[preference_uri], uri=preference_uri)
+    if entity.memory_type != "entities" or preference.memory_type != "preferences":
+        raise AssertionError("实体或偏好 memory_type 错误")
+    for alternatives in CASE_MEMORY_ROOT.required_facts:
+        if not any(term.casefold() in entity.content.casefold() for term in alternatives):
+            raise AssertionError(f"实体丢失独立事实: {alternatives}")
+    for alternatives in (
+        ("喜欢", "偏好", "prefer", "like"),
+        ("小班", "small-group", "small group", "small class"),
+        (
+            "最多六人",
+            "最多6人",
+            "不超过六人",
+            "不超过6人",
+            "上限六人",
+            "上限6人",
+            "≤6",
+            "at most six",
+            "at most 6",
+            "up to six",
+            "up to 6",
+            "maximum of six",
+            "maximum of 6",
+            "no more than six",
+            "no more than 6",
+        ),
+        ("逐个", "逐一", "一对一", "个别", "individual", "one-on-one", "one by one"),
+        ("指导", "guidance", "instruction", "coaching"),
+    ):
+        if not any(term in preference.content.casefold() for term in alternatives):
+            raise AssertionError(f"偏好丢失独立事实: {alternatives}")
+    if preference.content == old_preference.content or len(preference.content) >= len(
+        old_preference.content
+    ):
+        raise AssertionError("偏好没有实际精简，不能以 links metadata 变化代替内容整理")
+    if entity.extra_fields.get("category") != "person" or entity.extra_fields.get(
+        "name"
+    ) != target_uri.rsplit("/", 1)[-1].removesuffix(".md"):
+        raise AssertionError("改名后的实体身份字段与目标 URI 不一致")
+    if any(
+        preference.extra_fields.get(field) != old_preference.extra_fields.get(field)
+        for field in ("user", "topic")
+    ):
+        raise AssertionError("偏好不可变字段被修改")
+    lines = [line.strip() for line in preference.content.splitlines() if line.strip()]
+    if len(lines) != len(set(lines)):
+        raise AssertionError("偏好正文仍有完全重复的行")
+    if "](https://example.com/docs)" not in preference.content:
+        raise AssertionError("外部课程资料链接丢失")
+    expected_link = {**old_preference.links[0], "to_uri": target_uri}
+    if expected_link not in preference.links or expected_link not in entity.backlinks:
+        raise AssertionError("实体和偏好的 links/backlinks 未同步迁移")
+    href = relpath(target_uri, preference_uri.rpartition("/")[0])
+    if f"]({href})" not in preference.content:
+        raise AssertionError("偏好正文中缺少新实体的内部链接")
+    old_relative = source_uri.removeprefix(root + "/")
+    if any(source_uri in raw or old_relative in raw for raw in after.values()):
+        raise AssertionError("根目录中仍残留旧实体 URI/href")
+
+
 # ── Phase 2: 触发 memory compile 并轮询 ─────────────────────────────────────
 
 
@@ -588,8 +837,7 @@ async def _run_memory_compile(client, directory: str, instruction: str) -> dict:
     task_id = result.get("task_id") or result.get("resource_id")
 
     if not task_id:
-        console.print("  [red]未拿到 task_id，无法轮询[/red]")
-        return {}
+        raise AssertionError(f"compile 未返回 task_id: {accepted}")
 
     console.print(f"  [yellow]等待整理完成 (task_id={task_id})...[/yellow]")
     now = time.time()
@@ -603,7 +851,16 @@ async def _run_memory_compile(client, directory: str, instruction: str) -> dict:
     status = task.get("status", "unknown") if task else "not found"
     console.print(f"  [green]任务 {status}，耗时 {elapsed:.2f}s[/green]")
     console.print(f"  Task 详情: {task}")
-    return task or {}
+    if (
+        not task
+        or status != "completed"
+        or task.get("error")
+        or (task.get("result") or {}).get("errors")
+    ):
+        raise AssertionError(f"compile 未成功完成: {task}")
+    if not isinstance(task.get("result"), dict):
+        raise AssertionError(f"compile 未返回结果: {task}")
+    return task
 
 
 # ── 入口 ───────────────────────────────────────────────────────────────────
@@ -611,7 +868,10 @@ async def _run_memory_compile(client, directory: str, instruction: str) -> dict:
 
 async def _run_case(client, args, case: CompileCase) -> None:
     """跑单个 compile case：种子对话 → 整理前快照 → compile → 整理后对比。"""
-    directory = args.to or _memory_dir(args.user, case.memory_type)
+    directory = _case_directory(args, case)
+    if case.key == "memory_root":
+        await _run_memory_root_case(client, args, case, directory)
+        return
     source_name = None
     target_name = None
     if case.rename_target_prefix:
@@ -619,15 +879,17 @@ async def _run_case(client, args, case: CompileCase) -> None:
 
     console.rule(f"[bold magenta]CASE: {case.key} — {case.description}[/bold magenta]")
 
-    console.rule(f"[bold]Phase 0b: 种子对话 case={case.key}[/bold]")
-    await _ingest_case_sessions(
-        client,
-        case,
-        wait_seconds=args.wait,
-        template_values={"source_name": source_name, "target_name": target_name}
-        if source_name and target_name
-        else None,
-    )
+    if source_name and target_name:
+        console.rule("[bold]Phase 0b: 创建中文实体与关联事件（不经过语言抽取）[/bold]")
+        initial_uri, event_uri = await _seed_rename_case(
+            client,
+            directory,
+            source_name,
+            target_name,
+        )
+    else:
+        console.rule(f"[bold]Phase 0b: 种子对话 case={case.key}[/bold]")
+        await _ingest_case_sessions(client, case, wait_seconds=args.wait)
 
     console.rule(f"[bold]Phase 1: 整理前 — {directory}[/bold]")
     before = await _snapshot_memory_dir(client, directory)
@@ -640,7 +902,8 @@ async def _run_case(client, args, case: CompileCase) -> None:
             directory=directory,
             source_name=source_name,
             english_name=target_name,
-            initial=before,
+            initial_uri=initial_uri,
+            event_uri=event_uri,
         )
         return
 
@@ -652,10 +915,7 @@ async def _run_case(client, args, case: CompileCase) -> None:
     if trace_id:
         console.print(f"  [bold cyan]trace_id: {trace_id}[/bold cyan]")
 
-    if task.get("status") == "completed":
-        _render_change_lists(result)
-    elif task.get("status") == "failed":
-        console.print(f"  [red]整理失败: {task.get('error')}[/red]")
+    _render_change_lists(result)
 
     # 等待向量化/overview 刷新
     await client.wait_processed()
@@ -694,6 +954,8 @@ async def _main_async(args) -> None:
         selected = list(CASES.values())
     else:
         selected = [CASES[args.case]]
+    for case in selected:
+        _case_directory(args, case)
 
     try:
         await client.initialize()
@@ -748,7 +1010,7 @@ def main():
             "compile 集成 case（默认: all，依次跑全部）。"
             "merge=合并两个同人不同称呼；split=拆分同名两人；"
             "dedup=原地精简重复表述；rename=目录和文件名中英文往返；"
-            "preferences=整理 preferences 类型。"
+            "preferences=整理 preferences 类型；memory_root=单任务整理多类型并校验文件和链接。"
         ),
     )
     parser.add_argument(
