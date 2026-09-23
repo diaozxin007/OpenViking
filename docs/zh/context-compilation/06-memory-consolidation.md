@@ -17,7 +17,7 @@
 
 ## 怎么用
 
-把 `--skill` 设为哨兵值 **`memory`**，`--to` 指向一个**记忆类型目录**即可：
+把 `--skill` 设为哨兵值 **`memory`**，`--to` 指向 **memories 根目录或某个记忆类型目录**即可：
 
 ```bash
 # 整理 entities（就地去重 / 合并 / 规范化）
@@ -35,20 +35,29 @@ ov compile \
   --skill memory
 ```
 
-命令同样立即返回一个 `cmp_...` 任务 ID，用 `ov task status <id>` 查看结果、用 `ov task cancel <id>` 取消。
+一次整理所有已存在且已启用的类型，使用同一个任务、同一个 ExtractLoop：
+
+```bash
+ov compile --to viking://user/<user_id>/memories --skill memory \
+  --instruction "整理已有记忆，保留独立事实，不要合并不同对象"
+```
+
+根目录下已存在的 `profile.md`、`identity.md`、`soul.md` 也会纳入；禁用或未注册的类型会跳过。用户 memories 根目录不包含 `peers/*/memories`，整理 peer 记忆需要明确指定该 peer 的 memories 根目录。
+
+命令同样立即返回一个任务 ID，用 `ov task status <id>` 查看结果、用 `ov task cancel <id>` 取消。
 
 ## 参数
 
 | 参数 | 说明 |
 |------|------|
 | `--skill memory` | 固定的哨兵值，触发记忆整理模式（不会被当作真实 Skill 解析）。 |
-| `--to` | 必填，必须是**某个记忆类型目录**（如 `.../memories/entities`），不能只到 `.../memories` 根。整理就在这个目录里就地进行。 |
+| `--to` | 必填，可为 **memories 根目录**（`.../memories`）或**某个记忆类型目录**（如 `.../memories/entities`）；不接受用户根目录。 |
 | `--from` | 记忆模式下**不接受**——整理不引入外部来源，只处理 `--to` 空间内已有的记忆。 |
 | `--instruction` | 可选。作为整理指令（软提示）交给模型。用来点破模型自己判断不出来的合并，比如"阿珍就是陈静娴，请合并"。 |
 
 ## 行为要点
 
-- **单一类型**：只加载 `--to` 目录对应的那一种记忆类型的 schema，模型只会生成这一类型的内容操作。若改名或合并影响已有 links/backlinks，系统仍会更新其它类型中的相邻记忆文件以维持引用完整性。
+- **类型范围**：指定类型目录时只加载该类型的 schema；指定 memories 根目录时将该空间内所有已存在且已启用的类型加载到同一个 ExtractLoop，各类型仍遵守自身 schema。若改名或合并影响已有 links/backlinks，系统仍会更新其它类型中的相邻记忆文件以维持引用完整性。
 - **就地整理**：`--from` 与 `--to` 是同一空间，不引入外部来源，因此不存在跨身份空间的串号问题。整理的空间（当前用户自己的 self 空间，还是某个 `peers/{peer_id}` 空间）由 `--to` 的 URI 决定。
 - **保守合并**：默认只合并明显是同一身份的记忆；不同实体即使话题、类别、属性相近也不会被强行合并。模型从内容判断不出来的合并（例如两个不同名字其实是同一个人），必须通过 `--instruction` 明确点破才会执行。
 - **不凭空创造**：只重组已有记忆，不会无中生有地新增事实。
@@ -66,8 +75,11 @@ ov compile \
 | `updates` / `total_updates` | 被修改的记忆文件（合并后的目标、原地精简的文件） |
 | `deletes` / `total_deletes` | 被删除/被合并掉的记忆文件 |
 | `trace_id` | 本次整理的 trace，用于排查 |
+| `memory_types` | 本次选中的类型列表；`memory_type` 在类型目录请求中为该类型，在根目录请求中为 `null` |
 
 清单中只包含文件 URI，不含正文——一次整理可能触及很多文件，正文不随结果返回。
+
+若 `errors` 非空且没有任何文件变更成功，任务标记为 `failed`，并保留结果和 trace。部分成功仍为 `completed`，成功变更和失败详情分别保留在清单与 `errors` 中；调用方必须检查 `errors`，不能只看任务状态。无改动且无错误时正常标记为 `completed`。
 
 一个典型的合并例子（把"阿珍"合并进"陈静娴"）：
 

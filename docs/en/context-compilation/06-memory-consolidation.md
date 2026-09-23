@@ -17,7 +17,7 @@ Running memory consolidation over a memory directory makes such a collection cle
 
 ## How to use it
 
-Set `--skill` to the sentinel value **`memory`** and point `--to` at a **memory-type directory**:
+Set `--skill` to the sentinel value **`memory`** and point `--to` at a **memories root or memory-type directory**:
 
 ```bash
 # Consolidate entities (dedup / merge / normalize in place)
@@ -35,20 +35,29 @@ ov compile \
   --skill memory
 ```
 
-The command returns a `cmp_...` task ID immediately. Use `ov task status <id>` to check the result and `ov task cancel <id>` to stop it.
+To consolidate all existing, enabled memory types in one task and one ExtractLoop:
+
+```bash
+ov compile --to viking://user/<user_id>/memories --skill memory \
+  --instruction "Consolidate existing memories without losing facts; keep distinct objects separate"
+```
+
+Root-level files such as `profile.md`, `identity.md`, and `soul.md` are included when present. Disabled and unregistered types are skipped. The user's root does not include `peers/*/memories`; target a peer's memories root explicitly to consolidate that space.
+
+The command returns a task ID immediately. Use `ov task status <id>` to check the result and `ov task cancel <id>` to stop it.
 
 ## Parameters
 
 | Parameter | Description |
 |-----------|-------------|
 | `--skill memory` | The fixed sentinel value that triggers memory-consolidation mode (it is not resolved as a real Skill). |
-| `--to` | Required, and must be a **memory-type directory** (e.g. `.../memories/entities`), not just the `.../memories` root. Consolidation happens in place inside this directory. |
+| `--to` | Required: a **memories root** (`.../memories`) or a **memory-type directory** (e.g. `.../memories/entities`). User roots are not accepted. |
 | `--from` | **Not accepted** in memory mode — consolidation pulls in no external sources; it only reorganizes memories already under `--to`. |
 | `--instruction` | Optional. Passed to the model as a consolidation instruction (a soft hint). Use it to make merges the model cannot infer on its own, e.g. "Ah-Zhen is Chen Jingxian, please merge them." |
 
 ## Behavior
 
-- **Single type**: only the schema of the memory type inferred from `--to` is loaded, and the model only produces content operations for that type. If a rename or merge affects existing links/backlinks, the system may still update neighboring memory files of other types to preserve referential integrity.
+- **Type scope**: a type directory loads only its schema; a memories root loads all existing enabled types in that space into one ExtractLoop, with each type retaining its own schema. If a rename or merge affects existing links/backlinks, the system may still update neighboring memory files of other types to preserve referential integrity.
 - **In place**: `--from` and `--to` are the same space and no external source is introduced, so there is no cross-identity leakage. The space being consolidated (the current user's own *self* space, or a `peers/{peer_id}` space) is determined by the `--to` URI.
 - **Conservative merging**: only memories that are clearly the same identity are merged; distinct entities are kept separate even when they share a topic, category, or attributes. A merge the model cannot infer from content (e.g. two different names that are actually one person) is performed only when `--instruction` spells it out.
 - **No fabrication**: it only reorganizes existing memories; it never invents new facts.
@@ -66,8 +75,11 @@ A memory-mode task result includes the **list of changed files** for the run, wi
 | `updates` / `total_updates` | Modified memory files (a merge target, an in-place compaction) |
 | `deletes` / `total_deletes` | Removed / merged-away memory files |
 | `trace_id` | The trace of this consolidation run, for troubleshooting |
+| `memory_types` | Types selected for this run; `memory_type` is the selected type for a type-directory request, or `null` for a root request |
 
 The list contains file URIs only, not content — a single run may touch many files, and their bodies are not returned in the result.
+
+If `errors` is non-empty and no file changes succeeded, the task is `failed` and retains its result and trace. Partial success remains `completed`, with successful changes and failures recorded separately in the lists and `errors`; callers must check `errors`, not just the task status. A no-op without errors is `completed`.
 
 A typical merge (folding "Ah-Zhen" into "Chen Jingxian"):
 

@@ -80,8 +80,8 @@ Task 结果中的 `created`、`updated` 和 `unchanged` 只统计 Agent 本次�
 ### 2.3 记忆整理模式（`--skill memory`）
 
 除了上面基于 VikingBot Skill 的 Wiki 整理，`ov compile` 还支持一种**记忆整理模式**：把 `--skill`
-设为哨兵值 `memory`，即可对 `--to` 指定的某个记忆类型目录做**就地整理**（去重、合并、拆分、原地精简），
-产物严格遵守该记忆类型的 schema。该模式完全在 OpenViking 进程内通过现有 memory 框架
+设为哨兵值 `memory`，即可对 `--to` 指定的 memories 根目录或某个记忆类型目录做**就地整理**（去重、合并、拆分、原地精简），
+产物严格遵守各自记忆类型的 schema。该模式完全在 OpenViking 进程内通过现有 memory 框架
 （`ExtractLoop` + `MemoryUpdater`）执行，**不经过 VikingBot**。
 
 ```bash
@@ -102,13 +102,13 @@ ov compile \
 | 参数 | 规则 |
 | --- | --- |
 | `--skill` | 固定值 `memory`（哨兵，不解析为真实 Skill）触发记忆整理模式 |
-| `--to` | 必填，必须是某个记忆类型目录（如 `.../memories/entities`），不能只到 `.../memories` 根 |
+| `--to` | 必填，可为 `.../memories` 根目录或某个记忆类型目录（如 `.../memories/entities`）；不接受用户根目录 |
 | `--from` | 记忆模式下**不接受**；整理就地发生在 `--to` 空间内 |
 | `--instruction` | 可选，作为整理指令（软提示）喂给整理模型；用于点破"两条其实是同一实体需合并"这类模型无法自行判断的场景 |
 
 行为要点：
 
-- **单一类型**：只加载 `--to` 目录推断出的那一种记忆类型的 schema，模型只生成该类型的内容操作；
+- **类型范围**：指定类型目录时只加载该类型；指定 memories 根目录时按 schema 存储路径发现已存在且已启用的类型，包括根目录单文件记忆，在同一任务、同一 ExtractLoop 中联合整理，不拆子任务。各类型仍遵守自身 schema；结果的 `memory_types` 列出本次范围，根目录请求的 `memory_type` 为 `null`。
   改名或合并时，系统仍可更新其它类型的相邻记忆文件以迁移 links/backlinks。
 - **就地整理**：`--from` 与 `--to` 是同一空间，不引入外部来源，因此不存在跨身份空间的串号问题；
   空间（self 或某个 `peers/{peer_id}`）由 `--to` 的 URI 决定。
