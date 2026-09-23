@@ -26,14 +26,15 @@ from openviking.session.memory.consolidation_context_provider import (
     build_consolidation_isolation_handler,
 )
 from openviking.session.memory.extract_loop import ExtractLoop
-from openviking.session.memory.memory_type_registry import get_default_registry
+from openviking.session.memory.memory_type_registry import MemoryTypeRegistry, get_default_registry
 from openviking.session.memory.memory_updater import MemoryUpdater
 from openviking.session.memory.streaming_memory_updater import (
     acquire_memory_operation_lease,
 )
+from openviking.session.memory.utils.uri import render_template
 from openviking.telemetry import tracer
 from openviking.telemetry.span_models import create_root_span_attributes
-from openviking_cli.exceptions import InvalidArgumentError
+from openviking_cli.exceptions import InvalidArgumentError, NotFoundError
 from openviking_cli.utils import get_logger
 from openviking_cli.utils.config import get_openviking_config
 
@@ -57,18 +58,45 @@ def _peer_id_from_memory_uri(uri: str) -> Optional[str]:
     return None
 
 
-def _memory_type_from_target(uri: str) -> str:
+def _memory_type_from_target(uri: str) -> Optional[str]:
     classification = classify_uri(uri)
     parts = uri_parts(uri)
-    if (
-        classification.context_type != "memory"
-        or classification.content_index is None
-        or len(parts) <= classification.content_index + 1
-    ):
+    if classification.context_type != "memory" or classification.content_index is None:
         raise InvalidArgumentError(
-            "Memory-mode Compile target must be inside a memory type directory"
+            "Memory-mode Compile target must be a memories root or inside a memory type directory"
         )
+    if classification.is_memory_root:
+        return None
     return parts[classification.content_index + 1]
+
+
+async def _discover_memory_types(
+    target: str,
+    registry: MemoryTypeRegistry,
+    viking_fs: Any,
+    ctx: RequestContext,
+) -> list[str]:
+    parts = uri_parts(target)
+    user_space = "/".join(parts[1:-1])
+    peer_id = _peer_id_from_memory_uri(target)
+    memory_types = []
+    for schema in registry.list_all():
+        if not schema.directory or (peer_id and not schema.peer_enabled):
+            continue
+        directory = render_template(schema.directory, {"user_space": user_space}).rstrip("/")
+        if directory != target and not directory.startswith(f"{target}/"):
+            continue
+        path = directory
+        is_directory = schema.filename_has_variables()
+        if not is_directory:
+            path = f"{directory}/{schema.filename_template.lstrip('/')}"
+        try:
+            stat = await viking_fs.stat(path, ctx=ctx, skip_count=True)
+        except NotFoundError:
+            continue
+        if bool(stat.get("isDir")) == is_directory:
+            memory_types.append(schema.memory_type)
+    return sorted(memory_types)
 
 
 class MemoryCompileRunner:
@@ -139,7 +167,7 @@ class MemoryCompileRunner:
         self,
         target: str,
         ctx: RequestContext,
-    ) -> tuple[str, str, Optional[str]]:
+    ) -> tuple[str, Optional[str], Optional[str]]:
         uri = validate_request_viking_uri(
             resolve_path_variables(target),
             ctx,
@@ -158,7 +186,7 @@ class MemoryCompileRunner:
         *,
         task_id: str,
         target: str,
-        memory_type: str,
+        memory_type: Optional[str],
         peer_id: Optional[str],
         instruction: Optional[str],
         ctx: RequestContext,
@@ -193,9 +221,26 @@ class MemoryCompileRunner:
                         instruction=instruction,
                         ctx=ctx,
                     )
+                result = {"to": target, "skill": "memory", "trace_id": trace_id, **result}
+                if result["errors"]:
+                    if not any(result[key] for key in ("adds", "updates", "deletes")):
+                        await tracker.fail(
+                            task_id,
+                            "MEMORY_CONSOLIDATION_FAILED: No memory changes succeeded; "
+                            "see result.errors for details",
+                            account_id=ctx.account_id,
+                            user_id=ctx.user.user_id,
+                            result=result,
+                        )
+                        return
+                    logger.warning(
+                        "Memory-mode compile %s partially succeeded: %s",
+                        task_id,
+                        result["errors"],
+                    )
                 await tracker.complete(
                     task_id,
-                    {"to": target, "skill": "memory", "trace_id": trace_id, **result},
+                    result,
                     account_id=ctx.account_id,
                     user_id=ctx.user.user_id,
                 )
@@ -218,38 +263,56 @@ class MemoryCompileRunner:
         self,
         *,
         target: str,
-        memory_type: str,
+        memory_type: Optional[str],
         peer_id: Optional[str],
         instruction: Optional[str],
         ctx: RequestContext,
     ) -> dict[str, Any]:
+        registry = get_default_registry()
+        viking_fs = self._fs._ensure_initialized()
+        memory_types = (
+            [memory_type]
+            if memory_type is not None
+            else await _discover_memory_types(target, registry, viking_fs, ctx)
+        )
+        result = {
+            "memory_type": memory_type,
+            "memory_types": memory_types,
+            "adds": [],
+            "updates": [],
+            "deletes": [],
+            "total_adds": 0,
+            "total_updates": 0,
+            "total_deletes": 0,
+            "errors": [],
+        }
+        if not memory_types:
+            return result
         config = get_openviking_config()
         vlm = config.vlm.get_vlm_instance()
-        registry = get_default_registry()
-
         provider = ConsolidationExtractContextProvider(
-            memory_type=memory_type,
+            memory_types=memory_types,
             target_directory=target,
             instruction=instruction,
             memory_registry=registry,
+            ctx=ctx,
+            viking_fs=viking_fs,
         )
-        provider._ctx = ctx
-        provider._viking_fs = self._fs._ensure_initialized()
 
         extract_context = provider.get_extract_context()
         isolation_handler = build_consolidation_isolation_handler(
             ctx,
             extract_context,
-            memory_type=memory_type,
+            memory_types=memory_types,
             peer_id=peer_id,
         )
         isolation_handler.prepare_messages()
-        provider._isolation_handler = isolation_handler
+        provider.bind_isolation_handler(isolation_handler)
         await provider.prepare_extraction_messages()
 
         orchestrator = ExtractLoop(
             vlm=vlm,
-            viking_fs=provider._viking_fs,
+            viking_fs=viking_fs,
             ctx=ctx,
             context_provider=provider,
             isolation_handler=isolation_handler,
@@ -259,18 +322,8 @@ class MemoryCompileRunner:
         )
         operations, _tools_used = await orchestrator.run()
         if operations is None:
-            return {
-                "memory_type": memory_type,
-                "adds": [],
-                "updates": [],
-                "deletes": [],
-                "total_adds": 0,
-                "total_updates": 0,
-                "total_deletes": 0,
-                "errors": [],
-            }
+            return result
 
-        viking_fs = provider._viking_fs
         lease = await acquire_memory_operation_lease(operations, viking_fs, ctx)
         try:
             updater = MemoryUpdater(
@@ -302,7 +355,7 @@ class MemoryCompileRunner:
                 updates.append(uri)
         deletes = list(apply_result.deleted_uris)
         return {
-            "memory_type": memory_type,
+            **result,
             "adds": adds,
             "updates": updates,
             "deletes": deletes,
