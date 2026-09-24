@@ -11,6 +11,7 @@ time.
 from datetime import datetime
 
 from openviking.storage.queuefs.semantic_msg import SemanticMsg
+from openviking.utils.model_call import model_workload
 
 
 def _now_epoch() -> int:
@@ -55,3 +56,10 @@ def test_from_dict_without_timestamp_still_gets_fresh_one():
     msg = SemanticMsg.from_dict({"uri": "viking://res/a", "context_type": "resource"})
     assert "timestamp" in msg.__dict__
     assert abs(msg.timestamp - _now_epoch()) <= 5
+
+
+def test_roundtrip_preserves_root_task_attribution():
+    with model_workload("add_resource", root_task_id="task-semantic"):
+        msg = SemanticMsg(uri="viking://res/a", context_type="resource")
+
+    assert SemanticMsg.from_json(msg.to_json()).root_task_id == "task-semantic"

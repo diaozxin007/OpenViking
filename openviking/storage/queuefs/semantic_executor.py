@@ -549,6 +549,7 @@ class SemanticTreeExecutor:
                     workload=scope.workload,
                     stage=scope.stage,
                     deadline_at=scope.deadline_at,
+                    root_task_id=scope.root_task_id,
                 ),
                 model_stage(scope.stage),
             ):

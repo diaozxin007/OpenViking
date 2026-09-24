@@ -110,7 +110,7 @@ Dashboard 先展示 attempts / logical calls 与 exhausted / logical calls，按
 
 ### 已实现的边界
 
-开发分支为 `feat/model-retry-governance`。`openviking/utils/model_call.py` 提供 sync/async 唯一 owner；工作上下文与单次调用状态分开保存，不修改共享模型实例。credential wrapper 只向选中的 adapter 显式委托一次请求；委托绑定 adapter 与当前执行线程/任务，消费后失效。独立子调用、并行任务和不同模型各自建立 logical call，不因处于同一调用栈而跳过预算。未绑定上下文时按在线处理，最多 1 次；两个后台入口明确绑定 offline，使用原配置 `max_retries + 1`，默认共 4 次。
+开发分支为 `feat/model-retry-governance`。`openviking/utils/model_call.py` 提供 sync/async 唯一 owner；`RetryContext` 保存单次 logical call 的 identity、root task 归属、共享次数、route、deadline 和终态，工作上下文与单次调用状态分开保存，不修改共享模型实例。credential wrapper 只向选中的 adapter 显式委托一次请求；委托绑定 adapter 与当前执行线程/任务，消费后失效。独立子调用、并行任务和不同模型各自建立 logical call，不因处于同一调用栈而跳过预算。未绑定上下文时按在线处理，最多 1 次；两个后台入口明确绑定 offline，使用原配置 `max_retries + 1`，默认共 4 次。该 context 仍为进程内对象，root task 只用于日志与 trace 关联，不代表跨 worker 的持久次数账本。
 
 当前覆盖 OpenAI / Volcengine / LiteLLM 的非流式 text / vision、Embedding 公共调用入口，以及实际配置使用的 MultiCredentialVLM / FailoverEmbedder。多凭证成功路由仍保持 sticky；短暂错误在候选凭证间切换，auth / quota 错误禁用当前 call 内的失败凭证，均消费统一总次数。原始 SDK 异常类型、status 与 body 保留，通过附加 `model_call_error` 终止信息阻止外层重新获得预算；无上游异常的 deadline / breaker 拒绝使用 ModelCallError。
 
@@ -203,3 +203,5 @@ native 验证发现文件/目录的新指标曾被内层 legacy `semantic_execut
 以上是 native 服务入口和真实后台队列的集成验证，不是完整产品 E2E：未覆盖 HTTP server/Ingress、多 Pod、Redis、进程崩溃、真实模型互通、长期记忆 ExtractLoop 协议与质量。Session 场景仅开启 working-memory summary；有限重试对长故障窗口成功率的影响仍需灰度观察。测试 context 保留供后续使用，临时测试 Pod 已删除；共享 QA 服务未改动。
 
 2026-09-23 修复 PR 评审发现的 MiniMax 同步响应头丢失问题。新增 10 个真实 requests/urllib3 与 loopback HTTP 场景：429/503 携带 `Retry-After: 60` 时只发送 1 次并以 `backoff_limit` 终止；携带 2 秒或 30 秒时，校验 owner 先选择对应等待值再发送恢复请求；无响应头时离线仍最多 4 次、在线和 401 仍 1 次。测试替换 owner 的 sleep 记录等待值，不进行真实的 30 秒等待；传输层保持真实。修复前 6 项失败、4 项通过，修复后这 10 项及相关 owner/provider/config 回归共 85 项通过。此次未重跑 K8s/STG，前述 7 个 native 场景仍对应 `a13c3e6b2`，不能作为本次修复的 STG 验收结果。
+
+2026-09-24 补齐合入前评审发现的边界：外层 rate-limit 循环先识别 owner 终态，不能重新发放预算；错误分类按“provider 显式分类、结构化语义 code/type、HTTP status、文本兜底”的顺序决策；Gemini 的明确 invalid-key HTTP 400 与 MiniMax 官方无歧义业务错误码在进入 owner 前归一化。异步 callback 即使吞掉取消并返回，owner 也会拒绝 deadline 后的结果；deadline 和外部取消均立即传播，已取消 callback 只在后台回收。root task 归因随 Embedding/Semantic 队列消息序列化和恢复，但不持久化 attempts 或 logical-call ID。breaker 的 HALF_OPEN 使用单探针租约及 generation 校验，其余并发请求在探针完成前拒绝，旧 generation 的迟到结果不能改变当前状态；取消或早退通过 finally 放弃未消费租约。上述调整不扩大流式、媒体、Rerank 或跨进程持久预算的范围。

@@ -104,6 +104,7 @@ class EmbeddingMsg:
     queue_enqueued_at: float = 0.0
     model_operation: str = "other"
     model_deadline_at: float | None = None
+    root_task_id: str = ""
 
     def __init__(
         self,
@@ -118,6 +119,7 @@ class EmbeddingMsg:
         queue_enqueued_at: float = 0.0,
         model_operation: str | None = None,
         model_deadline_at: float | None = None,
+        root_task_id: str | None = None,
         *,
         payload: EmbeddingPayload | None = None,
     ) -> None:
@@ -130,6 +132,7 @@ class EmbeddingMsg:
             if model_operation is None and model_deadline_at is None
             else model_deadline_at
         )
+        self.root_task_id = model_scope.root_task_id if root_task_id is None else str(root_task_id)
         self.queue_enqueued_at = max(float(queue_enqueued_at or 0.0), 0.0)
         self.action = IndexAction(action)
         if payload is not None:
@@ -336,6 +339,7 @@ class EmbeddingMsg:
                 if self.model_deadline_at is not None
                 else {}
             ),
+            **({"root_task_id": self.root_task_id} if self.root_task_id else {}),
             "action": self.action.value,
             "payload": self.payload.to_dict(),
         }
@@ -403,6 +407,7 @@ class EmbeddingMsg:
                 queue_enqueued_at=data.get("queue_enqueued_at", 0.0),
                 model_operation=data.get("model_operation", "other"),
                 model_deadline_at=data.get("model_deadline_at"),
+                root_task_id=data.get("root_task_id", ""),
             )
         else:
             obj = cls(
@@ -417,6 +422,7 @@ class EmbeddingMsg:
                 queue_enqueued_at=data.get("queue_enqueued_at", 0.0),
                 model_operation=data.get("model_operation", "other"),
                 model_deadline_at=data.get("model_deadline_at"),
+                root_task_id=data.get("root_task_id", ""),
             )
         obj.id = str(data.get("id") or obj.id)
         return obj

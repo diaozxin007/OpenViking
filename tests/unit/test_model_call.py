@@ -7,12 +7,15 @@ from types import SimpleNamespace
 import pytest
 
 from openviking.metrics.datasources.model_retry import ModelRetryEventDataSource
+from openviking.service.task_work_index import bind_task_context
 from openviking.storage.queuefs.embedding_msg import EmbeddingMsg
 from openviking.storage.queuefs.semantic_msg import SemanticMsg
 from openviking.telemetry.context import bind_telemetry_stage, get_current_telemetry_stage
 from openviking.utils.model_call import (
     ModelCallError,
+    RetryContext,
     current_model_workload,
+    current_retry_context,
     delegate_model_call,
     is_model_call_error,
     model_stage,
@@ -31,6 +34,99 @@ def events(monkeypatch):
     )
     monkeypatch.setattr("openviking.utils.model_call.random.uniform", lambda *_: 0)
     return events
+
+
+@pytest.mark.asyncio
+async def test_retry_context_is_shared_by_failover_attempts_and_restored(events):
+    observed = []
+    deadline = time.time() + 60
+    primary_adapter = object()
+    backup_adapter = object()
+
+    async def request(error=None):
+        observed.append((current_retry_context(), current_retry_context().attempts))
+        if error is not None:
+            raise error
+        return "ok"
+
+    async def primary():
+        with delegate_model_call(primary_adapter):
+            return await run_model_async(
+                lambda: request(RuntimeError("401 Unauthorized")),
+                model_type="vlm",
+                adapter=primary_adapter,
+            )
+
+    async def backup():
+        with delegate_model_call(backup_adapter):
+            return await run_model_async(request, model_type="vlm", adapter=backup_adapter)
+
+    with model_workload(
+        "add_resource",
+        stage="parse",
+        deadline_at=deadline,
+        root_task_id="task-123",
+    ):
+        assert await run_model_async(primary, alternatives=[backup], model_type="vlm") == "ok"
+
+    context = observed[0][0]
+    assert isinstance(context, RetryContext)
+    assert observed[1][0] is context
+    assert [attempts for _context, attempts in observed] == [1, 2]
+    assert (
+        context.operation,
+        context.workload,
+        context.stage,
+        context.deadline_at,
+        context.root_task_id,
+        context.max_attempts,
+        context.attempts,
+        context.route,
+        context.disabled_routes,
+    ) == ("add_resource", "offline", "parse", deadline, "task-123", 4, 2, 1, {0})
+    assert current_retry_context() is None
+
+
+def test_nested_model_call_gets_an_independent_retry_context(events):
+    observed = []
+
+    def nested():
+        observed.append(("nested", current_retry_context()))
+        return "nested-ok"
+
+    def outer():
+        observed.append(("outer-before", current_retry_context()))
+        assert run_model_sync(nested, model_type="embedding") == "nested-ok"
+        observed.append(("outer-after", current_retry_context()))
+        return "outer-ok"
+
+    with model_workload("add_resource"):
+        assert run_model_sync(outer, model_type="vlm") == "outer-ok"
+
+    outer_before = observed[0][1]
+    nested_context = observed[1][1]
+    outer_after = observed[2][1]
+    assert isinstance(outer_before, RetryContext)
+    assert isinstance(nested_context, RetryContext)
+    assert outer_before is outer_after
+    assert nested_context is not outer_before
+    assert outer_before.attempts == nested_context.attempts == 1
+    assert current_retry_context() is None
+
+
+def test_retry_context_inherits_bound_root_task(events):
+    observed = []
+
+    with bind_task_context("task-from-queue", "account", "user"):
+        assert (
+            run_model_sync(
+                lambda: observed.append(current_retry_context()) or "ok",
+                model_type="embedding",
+            )
+            == "ok"
+        )
+
+    assert observed[0].root_task_id == "task-from-queue"
 
 
 @pytest.mark.asyncio
@@ -311,6 +407,100 @@ def test_sync_request_cannot_publish_a_result_after_deadline(events, monkeypatch
     expected = "ok" if elapsed < 0.02 else "error"
     assert [p["result"] for e, p in events if e == "model_retry.logical_call"] == [expected]
     assert [p["result"] for e, p in events if e == "model_retry.attempt"] == [expected]
+
+
+@pytest.mark.asyncio
+async def test_async_request_cannot_publish_a_result_after_suppressed_cancellation(events):
+    async def request():
+        try:
+            await asyncio.sleep(60)
+        except asyncio.CancelledError:
+            await asyncio.sleep(0)
+            return "late-success"
+
+    with model_workload("add_resource", deadline_at=time.time() + 0.01):
+        with pytest.raises(ModelCallError, match="deadline") as caught:
+            await run_model_async(request, model_type="embedding")
+
+    assert caught.value.attempts == 1
+    assert [p["result"] for e, p in events if e == "model_retry.logical_call"] == ["error"]
+    assert [p["result"] for e, p in events if e == "model_retry.attempt"] == ["error"]
+
+
+@pytest.mark.asyncio
+async def test_async_request_cannot_swallow_caller_cancellation(events):
+    started = asyncio.Event()
+
+    async def request():
+        started.set()
+        try:
+            await asyncio.sleep(60)
+        except asyncio.CancelledError:
+            await asyncio.sleep(0)
+            return "should-not-publish"
+
+    task = asyncio.create_task(run_model_async(request, model_type="embedding"))
+    await started.wait()
+    task.cancel()
+
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+    assert [p["result"] for e, p in events if e == "model_retry.logical_call"] == ["cancelled"]
+    assert [p["result"] for e, p in events if e == "model_retry.attempt"] == ["cancelled"]
+
+
+@pytest.mark.asyncio
+async def test_deadline_does_not_wait_for_cancelled_callback_cleanup(events):
+    cleanup_started = asyncio.Event()
+    finish_cleanup = asyncio.Event()
+
+    async def request():
+        try:
+            await asyncio.sleep(60)
+        except asyncio.CancelledError:
+            cleanup_started.set()
+            await finish_cleanup.wait()
+            return "late-success"
+
+    with model_workload("add_resource", deadline_at=time.time() + 0.01):
+        task = asyncio.create_task(run_model_async(request, model_type="embedding"))
+        await cleanup_started.wait()
+        with pytest.raises(ModelCallError, match="deadline"):
+            await asyncio.wait_for(task, timeout=0.1)
+        finish_cleanup.set()
+        await asyncio.sleep(0)
+
+    assert [p["result"] for e, p in events if e == "model_retry.logical_call"] == ["error"]
+    assert [p["result"] for e, p in events if e == "model_retry.attempt"] == ["error"]
+
+
+@pytest.mark.asyncio
+async def test_caller_cancellation_does_not_wait_for_callback_cleanup(events):
+    started = asyncio.Event()
+    cleanup_started = asyncio.Event()
+    finish_cleanup = asyncio.Event()
+
+    async def request():
+        started.set()
+        try:
+            await asyncio.sleep(60)
+        except asyncio.CancelledError:
+            cleanup_started.set()
+            await finish_cleanup.wait()
+            return "late-success"
+
+    task = asyncio.create_task(run_model_async(request, model_type="embedding"))
+    await started.wait()
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await asyncio.wait_for(task, timeout=0.1)
+    await cleanup_started.wait()
+    finish_cleanup.set()
+    await asyncio.sleep(0)
+
+    assert [p["result"] for e, p in events if e == "model_retry.logical_call"] == ["cancelled"]
+    assert [p["result"] for e, p in events if e == "model_retry.attempt"] == ["cancelled"]
 
 
 @pytest.mark.asyncio

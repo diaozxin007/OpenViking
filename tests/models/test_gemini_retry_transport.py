@@ -76,3 +76,52 @@ async def test_gemini_http_budget(
         for instance in clients:
             await instance.aio.aclose()
             instance.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("asynchronous", [False, True])
+async def test_gemini_invalid_key_400_advances_to_backup(monkeypatch, asynchronous):
+    sent = []
+    clients = []
+    real_client = genai.Client
+
+    def respond(request):
+        sent.append(request)
+        if len(sent) == 1:
+            return httpx.Response(
+                400,
+                json={
+                    "error": {
+                        "code": 400,
+                        "message": "API key not valid. Please pass a valid API key.",
+                        "status": "INVALID_ARGUMENT",
+                    }
+                },
+            )
+        return httpx.Response(200, json={"embeddings": [{"values": [0.6, 0.8]}]})
+
+    def client(**kwargs):
+        options = kwargs["http_options"]
+        options.httpx_client = httpx.Client(transport=httpx.MockTransport(respond))
+        options.httpx_async_client = httpx.AsyncClient(transport=httpx.MockTransport(respond))
+        instance = real_client(**kwargs)
+        clients.append(instance)
+        return instance
+
+    monkeypatch.setattr(genai, "Client", client)
+    backends = [
+        GeminiDenseEmbedder("fixture", api_key=f"fixture-{index}", dimension=2)
+        for index in range(2)
+    ]
+    model = FailoverEmbedder(backends, ["first", "second"])
+
+    try:
+        with model_workload("add_resource"):
+            result = await model.embed_async("fixture") if asynchronous else model.embed("fixture")
+        assert result.dense_vector == pytest.approx([0.6, 0.8])
+        assert model.active_credential_id == "second"
+        assert len(sent) == 2
+    finally:
+        for instance in clients:
+            await instance.aio.aclose()
+            instance.close()

@@ -2532,7 +2532,10 @@ class Session:
             request_wait_tracker.register_request(telemetry.telemetry_id)
             register_telemetry(telemetry)
             try:
-                with bind_telemetry(telemetry), model_workload("session_commit"):
+                with (
+                    bind_telemetry(telemetry),
+                    model_workload("session_commit", root_task_id=task_id),
+                ):
                     ov_config = get_openviking_config()
                     effective_policy = MemoryPolicy.from_dict(memory_policy)
                     extraction_batch_limits = resolve_extraction_batch_limits(auto_commit_policy)

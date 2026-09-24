@@ -229,7 +229,7 @@ class AddResourceProcessor(DequeueHandlerBase):
 
         with (
             bind_execution_context(),
-            model_workload("add_resource"),
+            model_workload("add_resource", root_task_id=msg.task_id),
             bind_telemetry(telemetry),
             bind_task_context(msg.task_id, ctx.account_id, ctx.user.user_id),
         ):

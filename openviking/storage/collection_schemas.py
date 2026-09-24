@@ -696,6 +696,7 @@ class TextEmbeddingHandler(DequeueHandlerBase):
                     embedding_msg.model_operation,
                     stage="embed_resource",
                     deadline_at=embedding_msg.model_deadline_at,
+                    root_task_id=embedding_msg.root_task_id,
                 ),
             ):
                 if self._vikingdb.is_closing:
@@ -1001,6 +1002,7 @@ class TextEmbeddingHandler(DequeueHandlerBase):
                 request_failed_message = error_msg
             return ProcessResult.failed(error_msg)
         finally:
+            self._circuit_breaker.abandon()
             if embedding_msg is not None and execute_started_at is not None:
                 tracker = get_request_wait_tracker()
                 record_timing = getattr(tracker, "record_embedding_timing", None)

@@ -398,6 +398,9 @@ class SemanticProcessor(DequeueHandlerBase):
                 user_id=msg.user_id,
                 peer_id=msg.peer_id,
             ),
+            # Parent freshness work is deliberately detached from the completed
+            # task lifecycle below; do not retain its root-task attribution.
+            root_task_id="",
         )
         with detach_task_context():
             await semantic_queue.enqueue(parent_msg)
@@ -488,6 +491,7 @@ class SemanticProcessor(DequeueHandlerBase):
                     msg.model_operation,
                     stage="semantic_execute",
                     deadline_at=msg.model_deadline_at,
+                    root_task_id=msg.root_task_id,
                 ),
             ):
                 root_attrs = create_root_span_attributes(
@@ -791,6 +795,7 @@ class SemanticProcessor(DequeueHandlerBase):
                     )
                 return ProcessResult.failed(str(e))
         finally:
+            self._circuit_breaker.abandon()
             if msg is not None and execute_started_at is not None:
                 tracker = get_request_wait_tracker()
                 record_timing = getattr(tracker, "record_semantic_timing", None)
