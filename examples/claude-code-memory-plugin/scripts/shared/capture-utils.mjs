@@ -642,16 +642,18 @@ export function shouldCaptureText(text, role, cfg = {}, { filters = true } = {})
   const sanitized = sanitizeCapturedText(text);
   if (!sanitized) return { shouldCapture: false, reason: "empty", text: "" };
 
-  let capped = truncateCaptureText(sanitized, maxLength);
+  // Rules judge the full sanitized turn; the wire cap applies afterward.
+  let filtered = sanitized;
   if (filters) {
     const compiled = compileInputFilters(cfg?.captureFilters);
     if (compiled.rules.length) {
-      const verdict = applyInputFilters(capped, compiled.rules, { role });
+      const verdict = applyInputFilters(filtered, compiled.rules, { role });
       if (verdict.dropped) return { shouldCapture: false, reason: "filtered", text: "" };
-      capped = verdict.text;
-      if (!capped) return { shouldCapture: false, reason: "empty", text: "" };
+      filtered = verdict.text;
+      if (!filtered) return { shouldCapture: false, reason: "empty", text: "" };
     }
   }
+  const capped = truncateCaptureText(filtered, maxLength);
   const compact = oneLine(capped);
   const isToolSummary = /^\[tool-(?:call|result)\b/i.test(compact);
 
