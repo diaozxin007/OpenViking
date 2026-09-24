@@ -1110,14 +1110,11 @@ def merge_output_language_from_messages(messages: list[Message]) -> str | None:
 
 
 def clone_operation_for_uri(op: ResolvedOperation, uri: str) -> ResolvedOperation:
-    old_file = getattr(op, "old_memory_file_content", None)
-    if old_file is not None and getattr(old_file, "uri", None) not in (None, uri):
-        old_file = None
     return op.model_copy(
         update={
             "uris": [uri],
             "memory_fields": dict(getattr(op, "memory_fields", {}) or {}),
-            "old_memory_file_content": old_file,
+            "old_memory_file_content": getattr(op, "old_memory_file_content", None),
             "source": getattr(op, "source", None),
         },
         deep=True,

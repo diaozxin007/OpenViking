@@ -21,6 +21,7 @@ from openviking.session.memory.extract_loop import (
     ExtractLoop,
 )
 from openviking.session.memory.memory_isolation_handler import MemoryIsolationHandler
+from openviking.session.memory.memory_updater import MemoryUpdater
 from openviking.session.memory.merge_op import (
     FieldType,
     MergeOp,
@@ -347,6 +348,71 @@ class TestExtractLoopFinalJsonRetry:
         assert operation.uris == [source_uri]
         assert operation.memory_fields["category"] == "person"
         assert operation.memory_fields["name"] == "阿珍"
+
+    @pytest.mark.asyncio
+    async def test_existing_update_keeps_legacy_case_uri_when_only_content_changes(self):
+        class PreferenceItem(BaseModel):
+            page_id: int
+            user: str | None = None
+            topic: str | None = None
+            content: str | None = None
+
+        class Operations(BaseModel):
+            preferences: list[PreferenceItem]
+            delete_ids: list = Field(default_factory=list)
+
+        source_uri = "viking://user/user_a/memories/preferences/Alice/food.md"
+        schema = MemoryTypeSchema(
+            memory_type="preferences",
+            directory="viking://user/{{ user_space }}/memories/preferences",
+            filename_template="{{ user|lower }}/{{ topic|lower }}.md",
+            fields=[
+                MemoryField(
+                    name="user",
+                    field_type=FieldType.STRING,
+                    merge_op=MergeOp.IMMUTABLE,
+                ),
+                MemoryField(
+                    name="topic",
+                    field_type=FieldType.STRING,
+                    merge_op=MergeOp.IMMUTABLE,
+                ),
+                MemoryField(
+                    name="content",
+                    field_type=FieldType.STRING,
+                    merge_op=MergeOp.REPLACE,
+                ),
+            ],
+        )
+        old_file = MemoryFile(
+            uri=source_uri,
+            memory_type="preferences",
+            content="- 喜欢辣的",
+            extra_fields={"user": "Alice", "topic": "food"},
+        )
+        context_provider = MagicMock()
+        context_provider.get_memory_schemas.return_value = [schema]
+        context_provider.read_file_contents = {source_uri: old_file}
+        ctx = MagicMock()
+        ctx.user.user_id = "user_a"
+        extract_context = MagicMock()
+        extract_context.messages = []
+        extract_context.page_id_map = PageIdMap()
+        page_id = extract_context.page_id_map.get_page_id(source_uri)
+        loop = object.__new__(ExtractLoop)
+        loop.ctx = ctx
+        loop.context_provider = context_provider
+        loop._extract_context = extract_context
+        loop._isolation_handler = MemoryIsolationHandler(ctx, extract_context)
+
+        resolved, _ = await loop.resolve_operations(
+            Operations(preferences=[PreferenceItem(page_id=page_id, content="- 微辣")])
+        )
+
+        operation = resolved.upsert_operations[0]
+        assert operation.uris == [source_uri]
+        assert operation.old_memory_file_content is old_file
+        assert not MemoryUpdater._is_uri_migration(operation)
 
     @pytest.mark.asyncio
     async def test_rename_conflict_refetches_target_then_requires_explicit_merge(self):

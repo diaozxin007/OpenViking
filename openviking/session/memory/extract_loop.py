@@ -997,6 +997,7 @@ class ExtractLoop:
 
         uri_fields = dict(old_content.extra_fields or {})
         schema_fields = {field.name: field for field in schema.fields}
+        identity_field_changed = False
         for field_name in schema.identity_fields(include_peer_id=False):
             field = schema_fields.get(field_name)
             if field is None or field_name not in operation.memory_fields:
@@ -1007,24 +1008,30 @@ class ExtractLoop:
                 else old_content.extra_fields.get(field_name)
             )
             try:
-                uri_fields[field_name] = await MergeOpFactory.from_field(field).apply(
+                new_value = await MergeOpFactory.from_field(field).apply(
                     current_value,
                     operation.memory_fields[field_name],
                 )
             except Exception:
-                uri_fields[field_name] = current_value
+                new_value = current_value
+            if new_value != current_value:
+                identity_field_changed = True
+            uri_fields[field_name] = new_value
+        if not identity_field_changed:
+            return source_uri
 
         prefix = "viking://user/"
         namespace, separator, _ = source_uri.partition("/memories/")
         if not separator or not namespace.startswith(prefix):
             return source_uri
         user_space = namespace.removeprefix(prefix)
-        return generate_uri(
+        candidate_uri = generate_uri(
             memory_type=schema,
             fields=uri_fields,
             user_space=user_space,
             extract_context=self._extract_context,
         )
+        return candidate_uri if candidate_uri != source_uri else source_uri
 
     def _normalize_delete_ids(self, raw_delete_ids: List[Any]) -> List[DeleteId]:
         delete_ids: List[DeleteId] = []

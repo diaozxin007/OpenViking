@@ -93,7 +93,7 @@ _CONTRACT_PREAMBLE = (
     "Prose frequently contains apostrophes (e.g. Evan's), quotes, colons, or dates that break "
     'single- or double-quoted literals. Inside triple quotes, escape any literal """ and '
     "backslash; never put a real newline inside a single- or double-quoted string.",
-    "Only keyword arguments are accepted by create, set, and obj.update(); a field's update() takes one positional string. Unknown business fields are ignored.",
+    "Only keyword arguments are accepted by create, set, and obj.update(); a field's update() takes one positional string.",
     "You may end the program with sdk.commit(); when present it must be the final call. If there are no changes, return only sdk.commit().",
     "Use the system-provided existing-object variable names exactly as shown. When a newly "
     "created memory must be referenced by delete(replacement=...) or link(...), assign the "

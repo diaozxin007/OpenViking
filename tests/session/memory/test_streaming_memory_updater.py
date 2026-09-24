@@ -1009,6 +1009,40 @@ def test_scope_memory_update_result_to_submitter_filters_shared_batch_by_source(
     assert scoped.metadata["unscoped_written_uris"] == [op_a.uris[0], op_b.uris[0]]
 
 
+def test_split_request_by_merge_group_keeps_rename_source_for_add_and_delete():
+    old_uri = "viking://user/u/memories/notes/old.md"
+    new_uri = "viking://user/u/memories/notes/new.md"
+    old_file = MemoryFile(
+        uri=old_uri,
+        content="old body",
+        memory_type="notes",
+        extra_fields={"note_name": "old"},
+    )
+    rename_op = ResolvedOperation(
+        old_memory_file_content=old_file,
+        memory_type="notes",
+        uris=[new_uri],
+        memory_fields={"note_name": "new", "content": "old body"},
+    )
+    request = MemoryUpdateRequest(
+        operations=ResolvedOperations(
+            upsert_operations=[rename_op],
+            delete_file_contents=[],
+            errors=[],
+        ),
+        messages=[],
+        ctx=_ctx(),
+    )
+
+    grouped = split_request_by_merge_group(request)
+
+    [(_, group_request)] = grouped
+    [cloned] = group_request.operations.upsert_operations
+    assert cloned.uris == [new_uri]
+    assert cloned.old_memory_file_content is not None
+    assert cloned.old_memory_file_content.uri == old_uri
+
+
 def test_split_request_by_merge_group_groups_by_peer_and_memory_type():
     self_op = _note_op("self_note")
     peer_op = _peer_note_op("peer_note", "web-visitor-alice")
