@@ -1168,7 +1168,7 @@ sdk.commit()
     assert blocks == [{"search": "Prefers Neovim", "replace": "Prefers Emacs"}]
 
 
-def test_python_field_edit_rejects_literal_field_placeholder():
+def test_python_unknown_field_is_silently_ignored():
     uri = "viking://user/alice/memories/preferences/editor.md"
     context = _context(
         [_preference_schema()],
@@ -1182,9 +1182,39 @@ def test_python_field_edit_rejects_literal_field_placeholder():
         context,
     )
 
-    assert operations is None
-    assert "memory field 'field' is unavailable" in error
-    assert "not the literal word 'field'" in error
+    # Unknown field access is a no-op: the statement compiles without
+    # touching server state and the whole program still commits.
+    assert error is None
+    assert operations is not None
+    assert operations.preferences == []
+
+
+def test_python_unknown_field_does_not_block_sibling_updates():
+    uri = "viking://user/alice/memories/preferences/editor.md"
+    context = _context(
+        [_preference_schema()],
+        files=[_existing_preference(uri, "editor", "Use Vim", 0)],
+    )
+    protocol = create_extraction_output_protocol("python")
+    _bind(protocol, context)
+
+    operations, error = protocol.parse(
+        """
+preferences_1.bogus.update("ignored")
+preferences_1.bogus.edit(search="Use Vim", replace="Use Neovim")
+preferences_1.bogus.drop(text="Tabs")
+preferences_1.content.edit(search="Use Vim", replace="Use Neovim")
+sdk.commit()
+""",
+        context,
+    )
+
+    assert error is None
+    item = operations.model_dump()["preferences"][0]
+    # The bogus field is silently dropped; the real content edit still applies.
+    assert item["content"]["blocks"] == [
+        {"search": "Use Vim", "replace": "Use Neovim"},
+    ]
 
 
 def test_python_field_edit_emits_block_regardless_of_uniqueness():

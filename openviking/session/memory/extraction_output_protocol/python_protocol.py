@@ -156,6 +156,7 @@ class _FieldHandle:
     field_name: str
     blocks: list[Any] = field(default_factory=list)
     full_value: Any = _UNSET
+    is_noop: bool = False
 
 
 class PythonExtractionOutputProtocol(ExtractionOutputProtocol):
@@ -768,19 +769,11 @@ class _PythonProgramCompiler:
             alias_map = self._field_alias_to_real.get(owner.memory_type, {})
             real_field = alias_map.get(node.attr, node.attr)
             if node.attr.startswith("_") or real_field not in owner.fields:
-                available = (
-                    ", ".join(sorted(_identifier_alias(name) for name in owner.fields)) or "(none)"
-                )
-                hint = (
-                    " Use the real field name (e.g. content), not the literal word 'field'."
-                    if node.attr == "field"
-                    else ""
-                )
-                self._error(
-                    node,
-                    f"memory field {node.attr!r} is unavailable; editable fields on "
-                    f"{owner.name or owner.memory_type}: {available}.{hint}",
-                )
+                # Unknown field: mirror the tolerance kwargs already have on
+                # create/set/update. Return a no-op handle so the whole
+                # program keeps compiling; the offending statement produces
+                # no effect on server state.
+                return _FieldHandle(owner=owner, field_name=real_field, is_noop=True)
             # obj.<field> is a write handle, not the raw value: it exposes
             # .update()/.edit()/.drop() and cannot be read as a string.
             return _FieldHandle(owner=owner, field_name=real_field)
@@ -1061,6 +1054,10 @@ class _PythonProgramCompiler:
         )
 
     def _call_field(self, handle: _FieldHandle, method: str, node: ast.Call) -> _FieldHandle:
+        if handle.is_noop:
+            # Unknown field: swallow the whole edit chain so the offending
+            # statement compiles without touching server state.
+            return handle
         if method == "update":
             kwargs = self._eval_keywords(node)
             if kwargs or len(node.args) != 1:
@@ -1106,6 +1103,9 @@ class _PythonProgramCompiler:
     def _apply_field_handle(self, handle: _FieldHandle, node: ast.AST) -> None:
         owner = handle.owner
         name = handle.field_name
+        if handle.is_noop:
+            # Unknown field: skip application entirely.
+            return
         schema = self.schemas[owner.memory_type]
         field_schema = {item.name: item for item in schema.fields}.get(name)
         if handle.full_value is _UNSET and not handle.blocks:
