@@ -777,7 +777,7 @@ async def read(
 
 @mcp.tool(name="list")
 async def ls(
-    uri: str,
+    uri: str = "viking://",
     recursive: bool = False,
     offset: int = 0,
     limit: int | None = None,
@@ -787,7 +787,7 @@ async def ls(
     """List one sorted page under a viking:// directory URI.
 
     Args:
-        uri: Directory URI to list.
+        uri: Directory URI to list; defaults to "viking://" like tree and glob.
         recursive: Whether to recursively list descendants.
         offset: Number of visible entries to skip.
         limit: Optional maximum number of entries.
@@ -818,7 +818,8 @@ async def ls(
     if sort_by is not None:
         options["sort_by"] = sort_by
         options["sort_order"] = sort_order
-    entries = await service.fs.ls(resolved_uri, **options)
+    page = await service.fs.ls(resolved_uri, **options)
+    entries = page.entries
     if not entries:
         return f"(no entries under {uri})"
 
@@ -831,6 +832,8 @@ async def ls(
             lines.append(f"[{'dir' if is_dir else 'file'}] {entry_uri}")
         else:
             lines.append(f"[{'dir' if is_dir else 'file'}] {name}")
+    if page.has_more:
+        lines.append("(more entries available; use offset and limit to view the next page)")
     return "\n".join(lines)
 
 
@@ -887,7 +890,7 @@ async def tree(
     output = "agent" if include_abstract else "original"
     effective_limit = limit if limit is not None else node_limit
     try:
-        entries = await service.fs.tree(
+        page = await service.fs.tree(
             resolved_uri,
             ctx=ctx,
             output=output,
@@ -897,7 +900,8 @@ async def tree(
             offset=offset,
         )
     except NotFoundError:
-        entries = []
+        page = None
+    entries = page.entries if page is not None else []
     if not entries:
         return f"(nothing under {uri})"
 
@@ -916,7 +920,7 @@ async def tree(
         abstract = _tree_abstract(e)
         if include_abstract and abstract:
             lines.append(f"{indent}  - {abstract}")
-    if len(entries) >= effective_limit:
+    if page is not None and page.has_more:
         lines.append(
             f"(truncated at node_limit={effective_limit}; narrow the uri or raise node_limit to see more)"
         )
@@ -1024,8 +1028,11 @@ async def edit(
         raise NotFoundError(uri, "file") from exc
     occurrences = current.count(old_string)
     if occurrences == 0:
+        hint = ""
+        if current.replace("\r\n", "\n").count(old_string.replace("\r\n", "\n")):
+            hint = " old_string matches only after normalizing CRLF/LF line endings."
         raise InvalidArgumentError(
-            f"old_string not found in {uri}. "
+            f"old_string not found in {uri}.{hint} "
             "Re-read the file with the read tool to get its current content."
         )
     if occurrences > 1 and not replace_all:
@@ -1171,6 +1178,12 @@ async def add_resource(
     For an agent skill, use add_skill instead: a skill added here is stored as an ordinary
     resource and never becomes an installed skill.
 
+    Where it goes: ``viking://resources/`` is shared with the whole account and is the
+    default when ``to`` and ``parent`` are empty (unless a default add target is
+    configured). ``viking://~/resources/`` is the caller's own resources, visible only to
+    them; pass ``parent="viking://~/resources"`` to store it there. If the user has not
+    said, ask whether the resource is personal or shared with the account.
+
     Remote URL: pass ``path`` as an http(s)://, git@, ssh://, or git:// URL. A sitemap /
     RSS / Atom URL ingests the WHOLE site as one resource tree; pass ``args={"site": true}``
     to force whole-site ingestion from a bare domain.
@@ -1195,17 +1208,20 @@ async def add_resource(
         processing_mode: "semantic_and_vectors" for normal semantic processing, or
             "vectors_only" to skip semantic understanding and only build vector indexes.
         to: Exact final URI including the leaf name (e.g.
-            "viking://resources/volcengine/OpenViking"). Written verbatim; an existing
+            "viking://resources/volcengine/OpenViking", or
+            "viking://~/resources/OpenViking" for a personal copy). Written verbatim; an existing
             target is synced to match the new source, so visible entries it does not
             contain are deleted. Required when ``add_type`` is set.
         parent: Existing directory to store the resource under, for remote or
-            local-file imports; the leaf name comes from the source. Never overwrites
+            local-file imports (e.g. "viking://~/resources" or "viking://resources");
+            the leaf name comes from the source. Never overwrites
             — a collision reserves the next free name ("name_1", "name_2", ...) and
             returns a warning. Mutually exclusive with ``to``; not supported when
             ``add_type`` is set. Leaving both empty derives the directory and the name
             from the source and handles collisions like ``parent``.
         tags: Optional explicit k=v retrieval tags to apply after ingestion.
-        tag_mode: Tag update mode, "replace" or "append". Defaults to "replace".
+        tag_mode: Tag update mode: "replace", "append", or "clear". Clear removes
+            existing tags without requiring ``tags``. Defaults to "replace".
         args: Parser-specific options, e.g. {"auth_config": {"token": "..."}}
             for native HTTPS Git imports and watches, {"feishu_access_token": "..."}
             for Feishu imports, {"site": true} for whole-site ingestion, or

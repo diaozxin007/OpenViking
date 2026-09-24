@@ -564,7 +564,7 @@ def test_message_roundtrip_preserves_operation_and_absolute_deadline(kind):
     cls = EmbeddingMsg if kind == "embedding" else SemanticMsg
     with model_workload("session_commit", deadline_at=12345):
         msg = (
-            cls(message="text")
+            cls(message="text", context_data={"account_id": "account-a"})
             if kind == "embedding"
             else cls(uri="viking://x", context_type="memory")
         )

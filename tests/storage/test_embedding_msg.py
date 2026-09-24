@@ -25,7 +25,7 @@ def test_embedding_msg_roundtrip_preserves_id_for_request_wait_tracker():
     try:
         msg = EmbeddingMsg(
             "hello",
-            {"uri": "viking://user/default/skills/demo"},
+            {"uri": "viking://user/default/skills/demo", "account_id": "default"},
             telemetry_id=telemetry_id,
         )
         tracker.register_embedding_root(telemetry_id, msg.id)
@@ -42,7 +42,7 @@ def test_embedding_msg_roundtrip_preserves_id_for_request_wait_tracker():
 def test_embedding_msg_roundtrip_preserves_queue_enqueue_time():
     msg = EmbeddingMsg(
         "hello",
-        {"uri": "viking://resources/demo"},
+        {"uri": "viking://resources/demo", "account_id": "default"},
         queue_enqueued_at=123.456,
     )
 
@@ -51,24 +51,30 @@ def test_embedding_msg_roundtrip_preserves_queue_enqueue_time():
 
 def test_embedding_msg_roundtrip_preserves_root_task_attribution():
     with model_workload("add_resource", root_task_id="task-embedding"):
-        msg = EmbeddingMsg("hello", {"uri": "viking://resources/demo"})
+        msg = EmbeddingMsg(
+            "hello",
+            {"uri": "viking://resources/demo", "account_id": "default"},
+        )
 
     assert EmbeddingMsg.from_json(msg.to_json()).root_task_id == "task-embedding"
 
 
-def test_legacy_embedding_msg_defaults_to_embed_and_upsert():
-    restored = EmbeddingMsg.from_dict(
-        {
-            "message": "hello",
-            "context_data": {"uri": "viking://resources/demo"},
-        }
-    )
-
-    assert restored.action is IndexAction.UPSERT
+def test_legacy_embedding_msg_without_account_id_is_rejected():
+    with pytest.raises(ValueError, match="account_id"):
+        EmbeddingMsg.from_dict(
+            {
+                "message": "hello",
+                "context_data": {"uri": "viking://resources/demo"},
+            }
+        )
 
 
 def test_embedding_msg_accepts_noop_index_action_roundtrip():
-    msg = EmbeddingMsg(None, {"uri": "viking://resources/demo"}, action=IndexAction.NONE)
+    msg = EmbeddingMsg(
+        None,
+        {"uri": "viking://resources/demo", "account_id": "default"},
+        action=IndexAction.NONE,
+    )
 
     restored = EmbeddingMsg.from_json(msg.to_json())
 
@@ -168,7 +174,7 @@ def test_field_patch_roundtrip_and_resolution():
         (
             EmbeddingMsg.for_embed(
                 message="body",
-                context_data={"uri": "viking://resources/demo/a.py"},
+                context_data={"uri": "viking://resources/demo/a.py", "account_id": "default"},
             ),
             EmbedPayload,
         ),
@@ -176,18 +182,23 @@ def test_field_patch_roundtrip_and_resolution():
             EmbeddingMsg.for_update_fields(
                 record_id="record-1",
                 field_patch=FieldPatch(values={"md5": "new-md5"}),
-                context_data={"uri": "viking://resources/demo/a.py"},
+                context_data={"uri": "viking://resources/demo/a.py", "account_id": "default"},
             ),
             UpdateFieldsPayload,
         ),
         (
             EmbeddingMsg.for_delete(
                 record_ids=["record-1"],
-                context_data={"uri": "viking://resources/demo/a.py"},
+                context_data={"uri": "viking://resources/demo/a.py", "account_id": "default"},
             ),
             DeletePayload,
         ),
-        (EmbeddingMsg.noop(context_data={"uri": "viking://resources/demo"}), NoopPayload),
+        (
+            EmbeddingMsg.noop(
+                context_data={"uri": "viking://resources/demo", "account_id": "default"}
+            ),
+            NoopPayload,
+        ),
     ],
 )
 def test_embedding_msg_roundtrip_uses_action_specific_payload(message, payload_type):
@@ -204,7 +215,7 @@ def test_embed_payload_rejects_patch_for_upsert():
     with pytest.raises(ValueError, match="upsert.*field patch"):
         EmbeddingMsg.for_embed(
             message="body",
-            context_data={"uri": "viking://resources/demo/a.py"},
+            context_data={"uri": "viking://resources/demo/a.py", "account_id": "default"},
             action=IndexAction.UPSERT,
             field_patch=FieldPatch(values={"search_tags": ["scope=new"]}),
         )
@@ -267,7 +278,7 @@ def test_update_fields_factory_rejects_duplicate_patch_representations():
     with pytest.raises(ValueError, match="field_patch cannot be combined"):
         EmbeddingMsg.for_update_fields(
             record_id="record-1",
-            context_data={"uri": "viking://resources/demo/a.py"},
+            context_data={"uri": "viking://resources/demo/a.py", "account_id": "default"},
             field_patch=FieldPatch({"md5": "new-md5"}),
             fields={"md5": "ignored-md5"},
         )
@@ -278,7 +289,10 @@ def test_legacy_upsert_discards_historically_ignored_fields():
         {
             "action": "upsert",
             "message": "body",
-            "context_data": {"uri": "viking://resources/demo/a.py"},
+            "context_data": {
+                "uri": "viking://resources/demo/a.py",
+                "account_id": "default",
+            },
             "record_ids": ["ignored-record"],
             "update_fields": {"md5": "ignored-md5"},
             "initial_fields": {"vector": [0.1, 0.2]},
@@ -301,7 +315,10 @@ def test_legacy_update_fields_message_normalizes_to_field_patch_payload():
     restored = EmbeddingMsg.from_dict(
         {
             "message": None,
-            "context_data": {"uri": "viking://resources/demo/a.py"},
+            "context_data": {
+                "uri": "viking://resources/demo/a.py",
+                "account_id": "default",
+            },
             "action": "update_fields",
             "record_ids": ["record-1"],
             "update_fields": {"search_tags": ["scope=new"]},

@@ -9,7 +9,7 @@ import asyncio
 import atexit
 import threading
 import time
-from typing import Any, Dict, Optional, Sequence, Set, Union
+from typing import TYPE_CHECKING, Any, Dict, Optional, Sequence, Set, Union
 
 from openviking.service.task_work_index import TaskWorkIndex
 from openviking_cli.utils.logger import get_logger
@@ -18,6 +18,9 @@ from .embedding_queue import EmbeddingQueue
 from .named_queue import DequeueHandlerBase, NamedQueue, QueueStatus
 from .queue_middleware import QueueMiddleware
 from .semantic_queue import SemanticQueue
+
+if TYPE_CHECKING:
+    from openviking.config.vlm import VLMResolver
 
 logger = get_logger(__name__)
 
@@ -127,6 +130,7 @@ class QueueManager:
         self._embedding_worker_stopped = threading.Event()
         self._poll_interval = 0.2
         self._task_work_index = TaskWorkIndex()
+        self._vlm_resolver: Optional["VLMResolver"] = None
         # Import at composition time to avoid a service <-> queue package cycle.
         from openviking.service.task_queue_middleware import TaskWorkQueueMiddleware
 
@@ -144,6 +148,8 @@ class QueueManager:
         """Start QueueManager workers."""
         if self._started:
             return
+        if self.SEMANTIC in self._queues and self._vlm_resolver is None:
+            raise RuntimeError("QueueManager requires a VLM resolver before semantic workers start")
 
         self._started = True
 
@@ -160,23 +166,29 @@ class QueueManager:
         tracker.attach_work_index(self._task_work_index)
         return await tracker.restore_work_tasks(owners)
 
-    def setup_standard_queues(self, vector_store: Any, start: bool = True) -> None:
+    def setup_standard_queues(
+        self,
+        vector_store: Any,
+        start: bool = True,
+        *,
+        embedding_provider: Any = None,
+    ) -> None:
         """
         Setup standard queues (Embedding and Semantic) with their handlers.
 
         Args:
             vector_store: Vector store instance for handlers to write results.
             start: Whether to start worker threads immediately (default True).
-                   Pass False when the consumer depends on resources that are
-                   not yet initialized (e.g. VikingFS); call start() manually
-                   after those resources are ready.
+                   Pass False when the consumer depends on resources that are not
+                   yet initialized.
+            embedding_provider: Account-aware embedding provider for the handler.
         """
         # Import handlers here to avoid circular dependencies
         from openviking.storage.collection_schemas import TextEmbeddingHandler
         from openviking.storage.queuefs import SemanticProcessor
 
         # Embedding Queue
-        embedding_handler = TextEmbeddingHandler(vector_store)
+        embedding_handler = TextEmbeddingHandler(vector_store, embedding_provider)
         self.get_queue(
             self.EMBEDDING,
             dequeue_handler=embedding_handler,
@@ -188,6 +200,7 @@ class QueueManager:
         semantic_processor = SemanticProcessor(
             max_concurrent_llm=self._max_concurrent_semantic,
             embedding_worker_stopped=self._embedding_worker_stopped.is_set,
+            vlm_resolver=self._vlm_resolver,
         )
         self.get_queue(
             self.SEMANTIC,
@@ -198,6 +211,23 @@ class QueueManager:
 
         if start:
             self.start()
+
+    def set_vlm_resolver(self, resolver: "VLMResolver") -> None:
+        """Bind the owning service's resolver before queue workers start."""
+        from openviking.storage.queuefs import SemanticProcessor
+
+        if self._started:
+            raise RuntimeError("Cannot replace the VLM resolver after queue workers start")
+        self._vlm_resolver = resolver
+        queue = self._queues.get(self.SEMANTIC)
+        if queue is not None:
+            queue.set_dequeue_handler(
+                SemanticProcessor(
+                    max_concurrent_llm=self._max_concurrent_semantic,
+                    embedding_worker_stopped=self._embedding_worker_stopped.is_set,
+                    vlm_resolver=resolver,
+                )
+            )
 
     def _start_queue_worker(self, queue: NamedQueue) -> None:
         """Start a dedicated worker thread for a queue if not already running."""

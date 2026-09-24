@@ -91,10 +91,21 @@ async def test_embedding_terminal_failure_settles_wait_without_requeue(
         is_closing=False,
         has_queue_manager=True,
         enqueue_embedding_msg=AsyncMock(),
-        uses_content_field=False,
+        account_uses_content_field=AsyncMock(return_value=False),
         upsert=AsyncMock(),
     )
-    handler = TextEmbeddingHandler(backend)
+    breaker = CircuitBreaker()
+
+    async def wait_until_ready(account_id, deadline_at=None):
+        assert account_id == "fixture"
+        await breaker.wait_until_ready(deadline_at=deadline_at)
+        return breaker
+
+    provider = SimpleNamespace(
+        bind=lambda account_id: embedder,
+        wait_until_ready=AsyncMock(side_effect=wait_until_ready),
+    )
+    handler = TextEmbeddingHandler(backend, provider)
     msg = EmbeddingMsg(
         message="fixture",
         context_data={
@@ -138,12 +149,14 @@ async def test_semantic_terminal_failure_releases_owned_lock_and_settles_wait(
         "openviking.storage.queuefs.semantic_processor.SemanticLockScope.resolve",
         AsyncMock(return_value=SimpleNamespace(lock=lease, close=close)),
     )
-    processor = SemanticProcessor()
+    resolver = SimpleNamespace(get_vlm=AsyncMock(return_value=SimpleNamespace()))
+    processor = SemanticProcessor(vlm_resolver=resolver)
     processor._reenqueue_semantic_msg = AsyncMock()
     processor._cleanup_local_artifact = AsyncMock()
+    breaker = processor._account_breaker("default")
     if breaker_open:
         monkeypatch.setattr(
-            processor._circuit_breaker,
+            breaker,
             "wait_until_ready",
             AsyncMock(side_effect=CircuitBreakerOpen("admission deadline exceeded")),
         )
@@ -198,7 +211,8 @@ def semantic_delivery(monkeypatch):
     monkeypatch.setattr(
         "openviking.storage.queuefs.semantic_processor.SemanticLockScope.resolve", resolve
     )
-    processor = SemanticProcessor()
+    resolver = SimpleNamespace(get_vlm=AsyncMock(return_value=SimpleNamespace()))
+    processor = SemanticProcessor(vlm_resolver=resolver)
     processor._reenqueue_semantic_msg = AsyncMock()
     processor._cleanup_local_artifact = AsyncMock()
     executor = SimpleNamespace(run=AsyncMock(), get_stats=lambda: None, stale=False)
@@ -220,6 +234,7 @@ def semantic_delivery(monkeypatch):
     yield SimpleNamespace(
         processor=processor,
         msg=msg,
+        breaker=processor._account_breaker(msg.account_id),
         tracker=tracker,
         agfs=agfs,
         lease=lease,
@@ -264,6 +279,7 @@ async def test_semantic_model_failure_propagates_through_real_executor(
     vlm = SimpleNamespace(
         get_completion_async=AsyncMock(side_effect=responses), is_available=lambda: True
     )
+    env.processor._vlm_resolver = SimpleNamespace(get_vlm=AsyncMock(return_value=vlm))
     config = SimpleNamespace(
         vlm=vlm,
         semantic=SimpleNamespace(
@@ -304,8 +320,9 @@ async def test_semantic_model_failure_propagates_through_real_executor(
 @pytest.mark.asyncio
 async def test_semantic_admission_recovers_in_same_delivery(semantic_delivery):
     env = semantic_delivery
-    env.processor._circuit_breaker = CircuitBreaker(failure_threshold=1, reset_timeout=0.01)
-    env.processor._circuit_breaker.record_failure(RuntimeError("503 unavailable"))
+    env.breaker = CircuitBreaker(failure_threshold=1, reset_timeout=0.01)
+    env.processor._circuit_breakers[env.msg.account_id] = env.breaker
+    env.breaker.record_failure(RuntimeError("503 unavailable"))
     result = await env.processor.on_dequeue(env.msg.to_dict())
     assert result.outcome is ProcessOutcome.SUCCESS
     env.executor.run.assert_awaited_once()
@@ -323,7 +340,7 @@ async def test_semantic_admission_cancel_releases_unadopted_handoff(semantic_del
         entered.set()
         await asyncio.Future()
 
-    env.processor._circuit_breaker.wait_until_ready = wait_until_ready
+    env.breaker.wait_until_ready = wait_until_ready
     task = asyncio.create_task(env.processor.on_dequeue(env.msg.to_dict()))
     await entered.wait()
     task.cancel()
@@ -356,7 +373,7 @@ async def test_semantic_storage_error_after_model_success_does_not_replay(
     env.executor.run.assert_awaited_once()
     env.close.assert_awaited_once()
     env.processor._reenqueue_semantic_msg.assert_not_awaited()
-    assert env.processor._circuit_breaker._failure_count == 0
+    assert env.breaker._failure_count == 0
     await asyncio.wait_for(env.tracker.wait_for_request(env.msg.telemetry_id), timeout=1)
     assert env.tracker.build_queue_status(env.msg.telemetry_id)["Semantic"]["error_count"] == 1
 
@@ -369,7 +386,7 @@ async def test_semantic_lock_conflict_before_execution_still_requeues(semantic_d
     assert result.outcome is ProcessOutcome.REQUEUED
     env.executor.run.assert_not_awaited()
     env.processor._reenqueue_semantic_msg.assert_awaited_once()
-    assert env.processor._circuit_breaker._failure_count == 0
+    assert env.breaker._failure_count == 0
 
 
 @pytest.mark.asyncio
@@ -396,10 +413,10 @@ async def test_semantic_only_started_provider_failure_affects_breaker(
     env.executor.run.side_effect = wrapper
     result = await env.processor.on_dequeue(env.msg.to_dict())
     assert result.outcome is ProcessOutcome.FAILED
-    assert env.processor._circuit_breaker._failure_count == expected_failures
+    assert env.breaker._failure_count == expected_failures
     if error_class in {"auth", "quota_exceeded"}:
         with pytest.raises(CircuitBreakerOpen):
-            env.processor._circuit_breaker.check()
+            env.breaker.check()
     else:
-        env.processor._circuit_breaker.check()
+        env.breaker.check()
     env.processor._reenqueue_semantic_msg.assert_not_awaited()

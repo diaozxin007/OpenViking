@@ -452,7 +452,9 @@ class FeishuAccessor(DataAccessor):
             source,
             config=kwargs.get("feishu_config"),
         )
-        return await worker._access(source, **kwargs)
+        from openviking.connector.auth import check_feishu_auth
+
+        return check_feishu_auth(await worker._access(source, **kwargs))
 
     async def _access(self, source: Union[str, Path], **kwargs) -> LocalResource:
         """
@@ -1664,6 +1666,11 @@ class FeishuAccessor(DataAccessor):
     def _user_request_option(feishu_access_token: Optional[str]):
         if not feishu_access_token:
             return None
+        from openviking.connector.auth import current_feishu_token
+
+        token_provider = current_feishu_token.get()
+        if token_provider is not None:
+            feishu_access_token = token_provider.get_token()
         from lark_oapi.core.model import RequestOption
 
         return RequestOption.builder().user_access_token(feishu_access_token).build()

@@ -1,61 +1,10 @@
 """Exercise the external provider through Hermes, with no bundled provider."""
 
 import json
-import os
-import shutil
-import sys
 import threading
 from http.server import BaseHTTPRequestHandler, HTTPServer
-from pathlib import Path
 
 import pytest
-
-
-@pytest.fixture
-def external_provider(tmp_path, monkeypatch):
-    monkeypatch.setattr(Path, "home", lambda: tmp_path)
-    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes"))
-    monkeypatch.setenv("HERMES_ENABLE_PROJECT_PLUGINS", "0")
-    for key in list(os.environ):
-        if key.startswith("OPENVIKING_"):
-            monkeypatch.delenv(key)
-
-    import plugins.memory as memory
-    from hermes_constants import reset_hermes_home_override, set_hermes_home_override
-
-    monkeypatch.setattr(memory, "_MEMORY_PLUGINS_DIR", tmp_path / "empty-bundled")
-    providers = []
-
-    def load(profile):
-        home = tmp_path / profile
-        target = home / "plugins" / "openviking"
-        if not target.exists():
-            shutil.copytree(
-                Path(__file__).resolve().parents[1],
-                target,
-                ignore=shutil.ignore_patterns("tests", "__pycache__", ".pytest_cache"),
-            )
-            (home / "config.yaml").write_text(
-                "memory:\n  provider: openviking\n  openviking:\n"
-                "    use_ovcli_config: false\n"
-                f"    agent: {profile}\n",
-                encoding="utf-8",
-            )
-        token = set_hermes_home_override(home)
-        try:
-            assert memory.find_provider_dir("openviking") == target
-            provider = memory.load_memory_provider("openviking", register_skills=False)
-            assert provider is not None
-            module = sys.modules[type(provider).__module__]
-            settings = module._resolve_connection_settings(module._load_hermes_openviking_config())
-        finally:
-            reset_hermes_home_override(token)
-        providers.append(provider)
-        return home, provider, module, settings
-
-    yield load
-    for provider in providers:
-        provider.shutdown()
 
 
 def test_external_discovery_preserves_profile_config_and_relative_setup(external_provider):
@@ -73,6 +22,63 @@ def test_external_discovery_preserves_profile_config_and_relative_setup(external
     assert module_b._setup._ov() is module_b
     assert provider_again.get_tool_schemas() == provider_a.get_tool_schemas()
     assert (home_a / "config.yaml").read_bytes() == before
+
+
+@pytest.mark.parametrize("target", ["memory", "user"])
+def test_external_native_memory_lifecycle_survives_restart(external_provider, target):
+    from agent.memory_manager import MemoryManager
+
+    files, requests = {}, []
+
+    class Client:
+        _endpoint, _api_key, _account, _user, _agent = "http://test", "", "test", "alice", ""
+
+        def get(self, path, **kwargs):
+            return {"result": {"user": self._user}}
+
+        def post(self, path, payload):
+            requests.append(("write", dict(payload)))
+            files[payload["uri"]] = payload["content"]
+            return {"result": {"uri": payload["uri"]}}
+
+        def delete(self, path, *, params):
+            requests.append(("delete", dict(params)))
+            del files[params["uri"]]
+            return {"result": {"uri": params["uri"]}}
+
+    client = Client()
+    operations = [
+        {"action": "add", "new_text": "Preferred shell is zsh"},
+        {"action": "replace", "old_text": "zsh", "new_text": "Preferred shell is fish"},
+        {"action": "remove", "old_text": "fish"},
+    ]
+    uri = None
+    for index, operation in enumerate(operations):
+        home, provider, _, _ = external_provider("mirror-restart")
+        provider._hermes_home = str(home)
+        provider._ensure_client = provider._new_client = lambda: client
+        manager = MemoryManager()
+        manager.add_provider(provider)
+        result = {"success": True}
+        if index == 1:
+            result["replaced_entries"] = {1: "Preferred shell is zsh"}
+        elif index == 2:
+            result["removed_entries"] = {1: "Preferred shell is fish"}
+        manager.notify_memory_tool_write(result, {"target": target, "operations": [operation]})
+        provider.shutdown()
+        registry = json.loads((home / "openviking/memory_mirror_registry.json").read_text())
+        if index == 0:
+            uri = next(iter(files))
+            assert files == {uri: "Preferred shell is zsh"}
+        elif index == 1:
+            assert files == {uri: "Preferred shell is fish"}
+        else:
+            assert files == {}
+        assert [entry["uri"] for entry in registry["entries"]] == ([uri] if files else [])
+
+    assert [payload["uri"] for _, payload in requests] == [uri, uri, uri]
+    assert requests[1][1]["wait"] is True
+    assert requests[2][1] == {"uri": uri, "recursive": False, "wait": True}
 
 
 def test_external_provider_dispatches_search_over_http(external_provider):
@@ -388,7 +394,8 @@ def test_external_provider_keeps_user_identity_across_reload(
         resume.set()
         worker.join(timeout=10)
         assert not worker.is_alive()
-        assert provider._join_all(lambda: list(provider._memory_write_threads), 10)
+        if operation == "mirror":
+            provider._native_memory_mirror.shutdown(timeout=10)
         block = provider.prefetch("", session_id="bob-session")
         assert "viking://user/bob/memories/profile.md" in block
         assert "viking://user/alice/" not in block
@@ -667,6 +674,65 @@ def test_session_switch_commits_below_live_threshold(external_provider, monkeypa
     assert provider._drain_finalizers(timeout=5)
     assert provider._client.post.call_args.args[0] == "/api/v1/sessions/live-sid/commit"
     assert provider._session_id == "new-sid"
+
+
+@pytest.mark.parametrize("agent_context", ["cron", "subagent", "flush"])
+def test_non_primary_contexts_skip_writes(external_provider, monkeypatch, agent_context):
+    """cron/subagent/flush contexts stay read-only: no turn uploads, commits, or mirroring."""
+    from unittest.mock import Mock
+
+    home, provider, module, _ = external_provider(f"non-primary-{agent_context}")
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    monkeypatch.setenv("OPENVIKING_ENDPOINT", "http://127.0.0.1:19531")
+    monkeypatch.setattr(module, "_classify_runtime_openviking_health", lambda *_: ("healthy", ""))
+    provider.initialize("live-sid", hermes_home=str(home))
+    assert (provider._agent_context, provider._writes_enabled) == ("primary", True)
+    provider.initialize("live-sid", hermes_home=str(home), agent_context=agent_context)
+    assert (provider._agent_context, provider._writes_enabled) == (agent_context, False)
+
+    provider._client = Mock()
+    provider._client.get.return_value = {"pending_tokens": 20000}
+    provider._ensure_client = lambda: True
+    provider._new_client = lambda: provider._client
+    provider._acquire_run_lock()
+    _finish_turn(provider)
+    provider.on_session_switch("new-sid")
+    provider.on_session_end([])
+    provider.on_memory_write("add", "user", f"not mirrored ({agent_context})")
+    assert provider._drain_finalizers(timeout=5)
+
+    assert provider._client.method_calls == []
+    assert provider._pending_sessions() == []
+
+
+@pytest.mark.parametrize("agent_context", ["cron", "subagent", "flush"])
+def test_non_primary_session_switch_keeps_search_on_current_session(external_provider, monkeypatch, agent_context):
+    """A read-only provider must still follow session changes for recall."""
+    from unittest.mock import Mock
+
+    from agent.memory_manager import MemoryManager
+
+    home, provider, module, _ = external_provider(f"read-only-switch-{agent_context}")
+    monkeypatch.setenv("OPENVIKING_ENDPOINT", "http://127.0.0.1:19531")
+    monkeypatch.setattr(module, "_classify_runtime_openviking_health", lambda *_: ("healthy", ""))
+    provider.initialize("old-sid", hermes_home=str(home), agent_context=agent_context)
+    client = Mock()
+    client.post.return_value = {"result": {"memories": []}}
+    provider._client = client
+    provider._ensure_client = lambda: client
+    provider._profile_prefetched_sessions.update({"old-sid", "new-sid"})
+
+    manager = MemoryManager()
+    manager.add_provider(provider)
+    manager.on_session_switch("new-sid", reason="compression")
+    assert provider._session_id == "new-sid"
+    assert provider._profile_prefetched_sessions == set()
+    provider.handle_tool_call("viking_search", {"query": "preferences", "mode": "deep"})
+    provider.on_session_end([])
+
+    client.post.assert_called_once_with(
+        "/api/v1/search/search", {"query": "preferences", "session_id": "new-sid"}
+    )
 
 
 def test_live_commit_does_not_block_next_turn_or_lose_its_pending_marker(external_provider, monkeypatch):

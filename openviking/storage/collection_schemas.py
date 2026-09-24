@@ -45,7 +45,6 @@ from openviking.storage.viking_vector_index_backend import (
 from openviking.telemetry import bind_telemetry, resolve_telemetry
 from openviking.telemetry.request_wait_tracker import get_request_wait_tracker
 from openviking.utils.circuit_breaker import (
-    CircuitBreaker,
     CircuitBreakerOpen,
     classify_api_error,
 )
@@ -340,6 +339,19 @@ async def init_context_collection(storage) -> bool:
             "Existing collection metadata is unavailable; cannot validate embedding compatibility"
         )
 
+    actual_dimension = next(
+        (
+            field.get("Dim")
+            for field in existing_meta.get("Fields", [])
+            if field.get("FieldName") == "vector"
+        ),
+        None,
+    )
+    if actual_dimension is not None and actual_dimension != vector_dim:
+        raise EmbeddingRebuildRequiredError(
+            f"Existing collection dimension {actual_dimension} differs from {vector_dim}"
+        )
+
     expected_fields = {field.get("FieldName") for field in schema["Fields"]}
     existing_fields = {field.get("FieldName") for field in existing_meta.get("Fields", [])}
     missing_fields = sorted(expected_fields - existing_fields)
@@ -485,29 +497,14 @@ class TextEmbeddingHandler(DequeueHandlerBase):
     _request_stats_order: List[str] = []
     _max_cached_stats = 1024
 
-    def __init__(self, vikingdb: VikingVectorIndexBackend):
+    def __init__(self, vikingdb: VikingVectorIndexBackend, embedding_provider=None):
         """Initialize the text embedding handler.
 
         Args:
             vikingdb: VikingVectorIndexBackend instance for writing to vector database
         """
-        from openviking_cli.utils.config import get_openviking_config
-
         self._vikingdb = vikingdb
-        self._embedder = None
-        config = get_openviking_config()
-        self._collection_name = config.storage.vectordb.name
-        self._vector_dim = config.embedding.dimension
-        breaker_cfg = config.embedding.circuit_breaker
-        self._circuit_breaker = CircuitBreaker(
-            failure_threshold=breaker_cfg.failure_threshold,
-            reset_timeout=breaker_cfg.reset_timeout,
-            max_reset_timeout=breaker_cfg.max_reset_timeout,
-        )
-
-    def _initialize_embedder(self, config: "OpenVikingConfig"):
-        """Initialize the embedder instance from config."""
-        self._embedder = config.embedding.get_embedder()
+        self._embedding_provider = embedding_provider
 
     @classmethod
     def _merge_request_stats(
@@ -668,6 +665,7 @@ class TextEmbeddingHandler(DequeueHandlerBase):
 
         embedding_msg: Optional[EmbeddingMsg] = None
         request_failed_message: Optional[str] = None
+        breaker = None
         execute_started_at: float | None = None
         queue_wait_ms = 0.0
         execute_status = "ok"
@@ -682,7 +680,9 @@ class TextEmbeddingHandler(DequeueHandlerBase):
                 self._embedding_delivery_log_context(embedding_msg),
                 embedding_msg.action.value,
             )
-            account_id = inserted_data.get("account_id", "default")
+            account_id = inserted_data.get("account_id")
+            if not isinstance(account_id, str) or not account_id.strip():
+                raise ValueError("Embedding message requires account_id")
             context_user = inserted_data.get("user") or {}
             user_id = context_user.get("user_id") or inserted_data.get("owner_user_id") or "default"
             user = UserIdentifier(account_id=account_id, user_id=user_id)
@@ -728,10 +728,13 @@ class TextEmbeddingHandler(DequeueHandlerBase):
                 # Admission waiting is bounded and consumes no model attempts.
                 # Keep this delivery instead of failing untouched work immediately
                 # or repeatedly re-enqueueing it during the same cooldown.
+                provider = self._embedding_provider
+                if provider is None:
+                    raise RuntimeError("Account embedding provider is not initialized")
                 try:
                     with pause_task_processing():
-                        await self._circuit_breaker.wait_until_ready(
-                            deadline_at=embedding_msg.model_deadline_at
+                        breaker = await provider.wait_until_ready(
+                            account_id, deadline_at=embedding_msg.model_deadline_at
                         )
                 except CircuitBreakerOpen as error:
                     execute_status = "error"
@@ -739,21 +742,16 @@ class TextEmbeddingHandler(DequeueHandlerBase):
                     self._merge_request_stats(embedding_msg.telemetry_id, error_count=1)
                     return ProcessResult.failed(request_failed_message)
 
-                # Initialize embedder if not already initialized
-                if not self._embedder:
-                    from openviking_cli.utils.config import get_openviking_config
-
-                    config = get_openviking_config()
-                    self._initialize_embedder(config)
+                embedder = provider.bind(account_id)
 
                 # Generate embedding vector(s)
-                if self._embedder:
+                if embedder:
                     try:
                         import time as _time
 
                         _embed_t0 = _time.monotonic()
                         result = await embed_compat(
-                            self._embedder,
+                            embedder,
                             embedding_msg.message,
                             is_query=False,
                         )
@@ -767,6 +765,13 @@ class TextEmbeddingHandler(DequeueHandlerBase):
                             )
                         except Exception:
                             pass
+                    except CircuitBreakerOpen as embed_err:
+                        execute_status = "error"
+                        request_failed_message = self._embedding_error_msg(
+                            embedding_msg, str(embed_err)
+                        )
+                        self._merge_request_stats(embedding_msg.telemetry_id, error_count=1)
+                        return ProcessResult.failed(request_failed_message)
                     except Exception as embed_err:
                         error_msg = self._embedding_error_msg(
                             embedding_msg,
@@ -793,7 +798,6 @@ class TextEmbeddingHandler(DequeueHandlerBase):
                         if error_class == ERROR_CLASS_PERMANENT:
                             execute_status = "error"
                             self._log_embedding_error(logging.CRITICAL, error_msg, embedding_msg)
-                            self._circuit_breaker.record_failure(embed_err)
                             self._merge_request_stats(embedding_msg.telemetry_id, error_count=1)
                             request_failed_message = error_msg
                             return ProcessResult.failed(error_msg)
@@ -811,7 +815,6 @@ class TextEmbeddingHandler(DequeueHandlerBase):
                         # The model layer already owns the complete attempt budget.
                         # Even an unclassified provider error is terminal here.
                         self._log_embedding_error(logging.ERROR, error_msg, embedding_msg)
-                        self._circuit_breaker.record_failure(embed_err)
                         self._merge_request_stats(embedding_msg.telemetry_id, error_count=1)
                         execute_status = "error"
                         request_failed_message = error_msg
@@ -820,18 +823,6 @@ class TextEmbeddingHandler(DequeueHandlerBase):
                     # Add dense vector
                     if result.dense_vector:
                         inserted_data["vector"] = result.dense_vector
-                        # Validate vector dimension
-                        if len(result.dense_vector) != self._vector_dim:
-                            execute_status = "error"
-                            error_msg = self._embedding_error_msg(
-                                embedding_msg,
-                                "Dense vector dimension mismatch: "
-                                f"expected {self._vector_dim}, got {len(result.dense_vector)}",
-                            )
-                            self._log_embedding_error(logging.ERROR, error_msg, embedding_msg)
-                            self._merge_request_stats(embedding_msg.telemetry_id, error_count=1)
-                            request_failed_message = error_msg
-                            return ProcessResult.failed(error_msg)
 
                     # Add sparse vector if present
                     if result.sparse_vector:
@@ -871,7 +862,7 @@ class TextEmbeddingHandler(DequeueHandlerBase):
                             account_id, uri, inserted_data.get("level", 2)
                         )
 
-                    if self._vikingdb.uses_content_field:
+                    if await self._vikingdb.account_uses_content_field(account_id):
                         inserted_data["content"] = await self._materialize_content(
                             embedding_msg,
                             ctx,
@@ -975,7 +966,6 @@ class TextEmbeddingHandler(DequeueHandlerBase):
                     embedding_msg,
                     vector_written=bool(record_id),
                 )
-                self._circuit_breaker.record_success()
                 return ProcessResult.success(inserted_data)
 
         except asyncio.CancelledError:
@@ -1002,7 +992,8 @@ class TextEmbeddingHandler(DequeueHandlerBase):
                 request_failed_message = error_msg
             return ProcessResult.failed(error_msg)
         finally:
-            self._circuit_breaker.abandon()
+            if breaker is not None:
+                breaker.abandon()
             if embedding_msg is not None and execute_started_at is not None:
                 tracker = get_request_wait_tracker()
                 record_timing = getattr(tracker, "record_embedding_timing", None)

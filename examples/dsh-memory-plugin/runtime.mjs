@@ -12,7 +12,7 @@ import { isRetryableFailure } from "./shared/retryable.mjs";
 import { resolveEffectivePeerId } from "./shared/workspace-peer.mjs";
 import {
   captureEvent,
-  OPENVIKING_PLUGIN_SOURCE,
+  isOpenVikingPluginMessage,
   pluginMessage,
   promptText,
 } from "./capture.mjs";
@@ -139,6 +139,7 @@ export class OpenVikingRuntime {
         actorPeerId: state.config.peerId,
         legacyPeerId: state.config.legacyPeerId,
         sessionId: state.ovSessionId,
+        excludeUris: state.config.recallExcludeUris,
         log: (stage, data) => this.log(stage, data),
       },
     );
@@ -420,7 +421,6 @@ function hasStartupProfile(agent) {
 }
 
 function isStartupProfile(message) {
-  return message?.source?.kind === "plugin"
-    && message.source.plugin === OPENVIKING_PLUGIN_SOURCE
+  return isOpenVikingPluginMessage(message)
     && message.source.form === "instructions";
 }

@@ -108,7 +108,7 @@ async def test_commit_retention_boundary_and_pending_tokens_after_reload(
         else {}
     )
     result = await session.commit_async(keep_recent_count=keep_count, **turn_options)
-    archived = await session._read_archive_messages(result["archive_uri"])
+    archived = await session._archives.read_messages(result["archive_uri"])
     retained = messages[archive_count:]
     assert [message.id for message in archived] == [m.id for m in messages[:archive_count]]
     assert [message.id for message in session.messages] == [m.id for m in retained]
@@ -226,8 +226,8 @@ async def test_session_context_skips_pending_archive_with_missing_messages(monke
         session_uri=session_uri,
     )
     monkeypatch.setattr(
-        session,
-        "_list_archive_refs",
+        session._archives,
+        "list_refs",
         AsyncMock(
             return_value=[{"archive_id": "archive_001", "archive_uri": archive_uri, "index": 1}]
         ),
@@ -395,12 +395,15 @@ async def test_working_memory_terminal_error_does_not_trigger_creation_fallback(
 ):
     from openviking.utils.model_call import ModelCallError
 
-    session = Session(viking_fs=_MemoryVikingFS({}), session_id="wm-retry-contract")
     terminal = ModelCallError("max_attempts", "transient", 4, "fixture")
     completion = AsyncMock(side_effect=terminal)
-    config = SimpleNamespace(
-        vlm=SimpleNamespace(is_available=lambda: True, get_completion_async=completion)
+    vlm = SimpleNamespace(is_available=lambda: True, get_completion_async=completion)
+    session = Session(
+        viking_fs=_MemoryVikingFS({}),
+        session_id="wm-retry-contract",
+        vlm_resolver=SimpleNamespace(get_vlm=AsyncMock(return_value=vlm)),
     )
+    config = SimpleNamespace(vlm=vlm)
     monkeypatch.setattr("openviking.session.session.get_openviking_config", lambda: config)
     monkeypatch.setattr(
         "openviking.session.session.resolve_output_language_from_conversation",

@@ -108,6 +108,16 @@ class CircuitBreaker:
     def check(self) -> None:
         """Allow the request through, or raise ``CircuitBreakerOpen``."""
         with self._lock:
+            admission = self._admission.get()
+            if (
+                admission is not None
+                and admission[0] == self._generation
+                and admission[1] == self._execution_identity()
+            ):
+                # Admission is scoped to this execution. This makes a bounded
+                # wait composable with a downstream provider check without
+                # admitting a second HALF_OPEN probe.
+                return
             if self._state == _STATE_CLOSED:
                 self._admit_current_execution()
                 return

@@ -34,6 +34,15 @@ class MergePlaceholderVLM(RecordingVLM):
         return "[first](viking://input_sample_f1) and [second](viking://input_sample_f2)"
 
 
+class _TestVLMResolver:
+    def __init__(self, vlm):
+        self._vlm = vlm
+
+    async def get_vlm(self, account_id):
+        del account_id
+        return self._vlm
+
+
 @pytest.mark.asyncio
 async def test_terminal_batch_cancels_and_drains_sibling_requests(monkeypatch):
     started = asyncio.Event()
@@ -61,7 +70,10 @@ async def test_terminal_batch_cancels_and_drains_sibling_requests(monkeypatch):
     )
     monkeypatch.setattr(semantic_processor_module, "get_openviking_config", lambda: config)
     monkeypatch.setattr(semantic_processor_module, "render_prompt", lambda *_: "prompt")
-    processor = SemanticProcessor(max_concurrent_llm=2)
+    processor = SemanticProcessor(
+        max_concurrent_llm=2,
+        vlm_resolver=_TestVLMResolver(config.vlm),
+    )
     with pytest.raises(ModelCallError, match="max_attempts"):
         await asyncio.wait_for(
             processor._generate_overview(
@@ -100,7 +112,7 @@ async def test_children_only_oversized_overview_is_batched(monkeypatch):
     )
     children = [{"name": f"child-{index}", "abstract": "x" * 20} for index in range(3)]
 
-    overview = await SemanticProcessor()._generate_overview(
+    overview = await SemanticProcessor(vlm_resolver=_TestVLMResolver(vlm))._generate_overview(
         "viking://resources/root",
         file_summaries=[],
         children_abstracts=children,
@@ -139,7 +151,7 @@ async def test_sampled_overview_prompt_describes_full_directory_coverage(monkeyp
 
     monkeypatch.setattr(semantic_processor_module, "render_prompt", fake_render_prompt)
 
-    await SemanticProcessor()._generate_overview(
+    await SemanticProcessor(vlm_resolver=_TestVLMResolver(vlm))._generate_overview(
         "viking://resources/docs_flat",
         file_summaries=[],
         children_abstracts=[{"name": "sample", "abstract": "summary"}],
@@ -176,17 +188,17 @@ async def test_batched_merge_resolves_placeholders_from_merge_output(monkeypatch
         lambda _name, values: values["file_summaries"],
     )
 
-    overview = await SemanticProcessor()._generate_overview(
-        "viking://resources/product docs",
+    overview = await SemanticProcessor(vlm_resolver=_TestVLMResolver(vlm))._generate_overview(
+        "viking://resources/业务 docs",
         file_summaries=[
             {"name": "first file.md", "summary": "first summary"},
-            {"name": "second#file.md", "summary": "second summary"},
+            {"name": "第二章#file.md", "summary": "second summary"},
         ],
         children_abstracts=[],
     )
 
     assert overview == (
-        "[first](viking://resources/product%20docs/first%20file.md) and "
-        "[second](viking://resources/product%20docs/second%23file.md)"
+        "[first](viking://resources/业务%20docs/first%20file.md) and "
+        "[second](viking://resources/业务%20docs/第二章%23file.md)"
     )
     assert "viking://input_sample_" not in overview
