@@ -1491,6 +1491,119 @@ class TestMemoryUpdater:
         updater._apply_delete.assert_awaited_once_with(source_uri, ctx, lease_ref=None)
 
     @pytest.mark.asyncio
+    async def test_apply_operations_rename_plus_merge_folds_duplicate_links(self):
+        # Same batch renames `old.md` -> `new.md` (implicit rename via URI
+        # field change) and merges a duplicate entity `duplicate.md` into the
+        # renamed target through an explicit replacement. Only `duplicate.md`
+        # holds a link to `profile.md`; the renamed target must inherit it and
+        # `profile.md`'s backlink must point at the renamed target.
+        old_uri = "viking://user/u/memories/entities/person/old.md"
+        new_uri = "viking://user/u/memories/entities/person/new.md"
+        duplicate_uri = "viking://user/u/memories/entities/person/duplicate.md"
+        profile_uri = "viking://user/u/memories/profile.md"
+        duplicate_link = {
+            "from_uri": duplicate_uri,
+            "to_uri": profile_uri,
+            "link_type": "related_to",
+            "weight": 0.8,
+            "match_text": "duplicate",
+            "description": "duplicate-only link",
+        }
+        old_file = MemoryFile(
+            uri=old_uri,
+            memory_type="entities",
+            content="primary",
+            extra_fields={"category": "person", "name": "old"},
+        )
+        duplicate_file = MemoryFile(
+            uri=duplicate_uri,
+            memory_type="entities",
+            content="alt",
+            extra_fields={"category": "person", "name": "duplicate"},
+            links=[duplicate_link],
+        )
+        profile_file = MemoryFile(
+            uri=profile_uri,
+            memory_type="profile",
+            content="profile",
+            backlinks=[duplicate_link],
+        )
+        # `new.md` should not already exist on disk; the renamed target is
+        # created by the upsert. Serialize the source files so read_file can
+        # produce them lazily.
+        store = {
+            old_uri: MemoryFileUtils.write(old_file),
+            duplicate_uri: MemoryFileUtils.write(duplicate_file),
+            profile_uri: MemoryFileUtils.write(profile_file),
+        }
+        mock_viking_fs = MagicMock()
+
+        async def read_file(uri, **kwargs):
+            if uri not in store:
+                raise NotFoundError(uri, "file")
+            return store[uri]
+
+        async def write_file(uri, content, **kwargs):
+            store[uri] = content
+
+        mock_viking_fs.read_file = AsyncMock(side_effect=read_file)
+        mock_viking_fs.write_file = AsyncMock(side_effect=write_file)
+        updater = MemoryUpdater(registry=MagicMock())
+        updater._get_viking_fs = MagicMock(return_value=mock_viking_fs)
+        # Bypass the real upsert path: simulate _apply_upsert copying old.md's
+        # (empty) links to new.md, which is what the production code does for
+        # implicit rename targets before _inherit_deleted_link_relations runs.
+        updater._apply_upsert = AsyncMock(
+            side_effect=lambda *args, **kwargs: store.__setitem__(
+                new_uri,
+                MemoryFileUtils.write(
+                    MemoryFile(
+                        uri=new_uri,
+                        memory_type="entities",
+                        content="primary+alt",
+                        extra_fields={"category": "person", "name": "new"},
+                    )
+                ),
+            )
+        )
+        updater._apply_delete = AsyncMock()
+        updater._validate_uri_migrations = AsyncMock(return_value=[])
+        updater._sync_resource_refs_for_result = AsyncMock()
+        updater._vectorize_memories = AsyncMock()
+        updater.generate_overview = AsyncMock()
+
+        operations = ResolvedOperations(
+            upsert_operations=[
+                ResolvedOperation(
+                    old_memory_file_content=old_file,
+                    memory_fields={"category": "person", "name": "new"},
+                    memory_type="entities",
+                    uris=[new_uri],
+                )
+            ],
+            delete_file_contents=[duplicate_file],
+            delete_replacements={duplicate_uri: new_uri},
+            errors=[],
+        )
+
+        result = await updater.apply_operations(operations, MagicMock())
+
+        # The duplicate's link must land on the renamed target.
+        new_file = MemoryFileUtils.read(store[new_uri], uri=new_uri)
+        assert any(
+            link.get("from_uri") == new_uri and link.get("to_uri") == profile_uri
+            for link in new_file.links
+        ), new_file.links
+        # And profile.md's backlink must be rewritten to come from `new.md`.
+        profile_after = MemoryFileUtils.read(store[profile_uri], uri=profile_uri)
+        assert any(
+            link.get("from_uri") == new_uri and link.get("to_uri") == profile_uri
+            for link in profile_after.backlinks
+        ), profile_after.backlinks
+        assert set(result.deleted_uris) >= {duplicate_uri, old_uri}
+        assert result.errors == []
+
+    @pytest.mark.asyncio
     async def test_apply_operations_keeps_source_when_explicit_replacement_is_missing(self):
         source_uri = "viking://user/u/memories/entities/person/阿珍.md"
         target_uri = "viking://user/u/memories/entities/person/陈静娴.md"

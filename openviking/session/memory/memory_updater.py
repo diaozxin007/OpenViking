@@ -1594,7 +1594,10 @@ class MemoryUpdater:
 
         from openviking.session.memory.merge_op.link_merge import merge_links
 
-        inherited_by_uri: Dict[str, Dict[str, List[Dict[str, Any]]]] = {}
+        # Track each inherited link's originating deleted URI so we can subtract
+        # contributions that were already folded in during _apply_upsert (e.g.
+        # the migration source of an implicit rename).
+        inherited_by_uri: Dict[str, Dict[str, List[Tuple[str, Dict[str, Any]]]]] = {}
         completed = True
         for deleted_uri, replacement_uri in uri_remap.items():
             if not deleted_uri or not replacement_uri or deleted_uri == replacement_uri:
@@ -1623,12 +1626,12 @@ class MemoryUpdater:
                 if target_uri:
                     inherited_by_uri.setdefault(target_uri, {"links": [], "backlinks": []})[
                         "links"
-                    ].append(remapped)
+                    ].append((deleted_uri, remapped))
                 neighbor_uri = remapped.get("to_uri")
                 if neighbor_uri and neighbor_uri not in uri_remap:
                     inherited_by_uri.setdefault(neighbor_uri, {"links": [], "backlinks": []})[
                         "backlinks"
-                    ].append(remapped)
+                    ].append((deleted_uri, remapped))
             for link in list(deleted_file.backlinks or []):
                 remapped = _remap_link_dict(link, uri_remap)
                 if remapped.get("from_uri") == remapped.get("to_uri"):
@@ -1637,27 +1640,37 @@ class MemoryUpdater:
                 if target_uri:
                     inherited_by_uri.setdefault(target_uri, {"links": [], "backlinks": []})[
                         "backlinks"
-                    ].append(remapped)
+                    ].append((deleted_uri, remapped))
                 neighbor_uri = remapped.get("from_uri")
                 if neighbor_uri and neighbor_uri not in uri_remap:
                     inherited_by_uri.setdefault(neighbor_uri, {"links": [], "backlinks": []})[
                         "links"
-                    ].append(remapped)
+                    ].append((deleted_uri, remapped))
 
         written_or_edited = set(result.written_uris + result.edited_uris)
-        implicit_migration_targets = {
-            operation.uris[0]
+        implicit_migration_source_by_target = {
+            operation.uris[0]: operation.old_memory_file_content.uri
             for operation in operations.upsert_operations
-            if self._is_uri_migration(operation) and len(operation.uris) == 1
+            if self._is_uri_migration(operation)
+            and len(operation.uris) == 1
+            and operation.old_memory_file_content
+            and operation.old_memory_file_content.uri
         }
         stale_uris = set(uri_remap)
         for uri, link_groups in inherited_by_uri.items():
             if uri in uri_remap:
                 continue
-            # Implicit renames copied and remapped the source links while
-            # writing the new file. Explicit merges update an existing target,
-            # so they still need the deleted source's relations folded in here.
-            if uri in implicit_migration_targets:
+            # Implicit renames already copied and remapped the source's links
+            # while writing the new file; drop that source's contribution to
+            # avoid a redundant rewrite. Contributions from other deleted
+            # replacements (e.g. a duplicate merged into the same target) are
+            # still folded in here.
+            excluded_source = implicit_migration_source_by_target.get(uri)
+            filtered_links = [link for src, link in link_groups["links"] if src != excluded_source]
+            filtered_backlinks = [
+                link for src, link in link_groups["backlinks"] if src != excluded_source
+            ]
+            if not filtered_links and not filtered_backlinks:
                 continue
             try:
                 content = await viking_fs.read_file(uri, ctx=ctx)
@@ -1681,10 +1694,10 @@ class MemoryUpdater:
                     if link.get("from_uri") not in stale_uris
                     and link.get("to_uri") not in stale_uris
                 ]
-                if link_groups["links"]:
-                    mf.links = merge_links(mf.links, link_groups["links"])
-                if link_groups["backlinks"]:
-                    mf.backlinks = merge_links(mf.backlinks, link_groups["backlinks"])
+                if filtered_links:
+                    mf.links = merge_links(mf.links, filtered_links)
+                if filtered_backlinks:
+                    mf.backlinks = merge_links(mf.backlinks, filtered_backlinks)
                 current_trace_id = get_trace_id()
                 if current_trace_id:
                     mf.extra_fields["last_update_trace_id"] = current_trace_id

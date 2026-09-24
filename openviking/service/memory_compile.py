@@ -268,8 +268,13 @@ class MemoryCompileRunner:
         instruction: Optional[str],
         ctx: RequestContext,
     ) -> dict[str, Any]:
-        registry = get_default_registry()
+        default_registry = get_default_registry()
         viking_fs = self._fs._ensure_initialized()
+        from openviking.session.memory.account_templates import resolve_account_memory_registry
+
+        registry = await resolve_account_memory_registry(
+            viking_fs, ctx.account_id, default_registry
+        )
         memory_types = (
             [memory_type]
             if memory_type is not None

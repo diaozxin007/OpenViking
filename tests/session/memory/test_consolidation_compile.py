@@ -30,7 +30,11 @@ from openviking.session.memory.dataclass import (
     ResolvedOperations,
 )
 from openviking.session.memory.memory_type_registry import MemoryTypeRegistry, get_default_registry
-from openviking.session.memory.memory_updater import ExtractContext, MemoryUpdateResult
+from openviking.session.memory.memory_updater import (
+    ExtractContext,
+    MemoryUpdater,
+    MemoryUpdateResult,
+)
 from openviking.session.memory.merge_op import FieldType, MergeOp
 from openviking.session.memory.utils.memory_file_utils import MemoryFileUtils
 from openviking_cli.exceptions import InvalidArgumentError, NotFoundError
@@ -485,6 +489,14 @@ def language_config(monkeypatch):
     ):
         monkeypatch.setattr(f"{module}.get_openviking_config", lambda: config)
     monkeypatch.setattr("openviking.service.memory_compile.get_default_registry", lambda: registry)
+
+    async def _passthrough_registry(_fs, _account, base):
+        return base
+
+    monkeypatch.setattr(
+        "openviking.session.memory.account_templates.resolve_account_memory_registry",
+        _passthrough_registry,
+    )
     return config
 
 
@@ -542,6 +554,69 @@ async def test_compile_resolves_language_before_prompt_and_schema(
     else:
         viking_fs.read.assert_awaited_once_with(uri, size=4096, ctx=_ctx())
         assert content not in str(vlm.get_completion_async.call_args.kwargs["messages"])
+
+
+@pytest.mark.asyncio
+async def test_compile_prefers_account_registry(monkeypatch, language_config):
+    language_config.output_language_override = "en"
+    language_config.vlm = SimpleNamespace(get_vlm_instance=lambda: SimpleNamespace(model="test"))
+    directory = "viking://user/u1/memories/entities"
+    deployment = language_config.registry
+    account_registry = MemoryTypeRegistry(load_schemas=False)
+    for schema in deployment.list_all(include_disabled=True):
+        account_registry.register(schema.model_copy(deep=True))
+    account_registry.get("soul").content_template = "# Company Assistant\n{{ content }}"
+
+    captured = {}
+
+    async def fake_resolver(fs, account_id, base_registry):
+        captured["resolver_called_with"] = (fs, account_id, base_registry)
+        return account_registry
+
+    monkeypatch.setattr(
+        "openviking.session.memory.account_templates.resolve_account_memory_registry",
+        fake_resolver,
+    )
+
+    def capture_run(self):
+        captured["provider_registry"] = self.context_provider._get_registry()
+        return AsyncMock(return_value=(None, []))()
+
+    monkeypatch.setattr("openviking.service.memory_compile.ExtractLoop.run", capture_run)
+    original_updater_init = MemoryUpdater.__init__
+
+    def capture_updater(self, *args, **kwargs):
+        captured["updater_registry"] = kwargs.get("registry") or (args[0] if args else None)
+        original_updater_init(self, *args, **kwargs)
+
+    monkeypatch.setattr("openviking.service.memory_compile.MemoryUpdater.__init__", capture_updater)
+    viking_fs = SimpleNamespace(
+        glob=AsyncMock(return_value={"matches": []}),
+        _async_agfs=SimpleNamespace(pathlock_release=AsyncMock()),
+    )
+    monkeypatch.setattr(
+        "openviking.service.memory_compile.acquire_memory_operation_lease",
+        AsyncMock(return_value=None),
+    )
+
+    runner = MemoryCompileRunner(SimpleNamespace(_ensure_initialized=lambda: viking_fs))
+    await runner._consolidate(
+        target=directory,
+        memory_type="entities",
+        peer_id=None,
+        instruction="check account templates",
+        ctx=_ctx(),
+    )
+
+    fs_arg, account_id, base_registry = captured["resolver_called_with"]
+    assert fs_arg is viking_fs
+    assert account_id == _ctx().account_id
+    assert base_registry is language_config.registry
+    assert captured["provider_registry"] is account_registry
+    assert (
+        captured["provider_registry"].get("soul").content_template
+        == "# Company Assistant\n{{ content }}"
+    )
 
 
 @pytest.mark.asyncio
