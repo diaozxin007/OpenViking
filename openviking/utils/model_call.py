@@ -59,6 +59,8 @@ _OPERATION_ALIASES = {
 
 @dataclass(frozen=True)
 class ModelWorkload:
+    """Bounded policy and attribution inherited by one model workload."""
+
     operation: str = "other"
     workload: str = "online"
     stage: str = "other"

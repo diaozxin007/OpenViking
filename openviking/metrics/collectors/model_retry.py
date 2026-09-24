@@ -6,6 +6,8 @@ from .base import EventMetricCollector
 
 
 class ModelRetryCollector(EventMetricCollector):
+    """Export bounded model-call retry events as Prometheus counters."""
+
     EVENTS = {
         "model_retry.logical_call": (
             MetricCollector.metric_name("model", "logical_calls", unit="total"),

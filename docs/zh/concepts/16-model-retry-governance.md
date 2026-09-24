@@ -81,7 +81,7 @@ Dashboard 先展示 attempts / logical calls 与 exhausted / logical calls，按
 
 ## 6. 验证、实施与回滚
 
-最初的独立原型位于 `test_scripts/model_retry/`，14 个契约测试及基线 HTTP 回放已保留。后续首版已接入实际 adapter、队列与 Phase 2，并接入四个 Metrics；验证结果和未覆盖路径见第 8 至 10 节。最后完成了隔离 K8s 中的 7 个 native 服务/队列场景；HTTP ingress、跨进程恢复、完整长期记忆抽取与线上灰度仍未覆盖，未发布共享服务。
+最初的独立原型用于固定策略契约和基线 HTTP 回放；生产实现落地后已移除该重复代码与生成结果。当前契约由实际 adapter、队列、Phase 2 和 Metrics 测试覆盖；验证结果和未覆盖路径见第 8 至 10 节。隔离 K8s 中还完成了 7 个 native 服务/队列场景；HTTP ingress、跨进程恢复、完整长期记忆抽取与线上灰度仍未覆盖，未发布共享服务。
 
 | 顺序 | 交付与验收 |
 | --- | --- |
@@ -184,7 +184,7 @@ K8s 按约定在本地与 adapter 回归之后执行。按部署文档新建独�
 
 ## 10. 最终 native 验证与回归边界
 
-2026-09-22 在隔离 K8s Pod 执行 `test_scripts/model_retry/native_e2e.py`，测试 Python 源码为 `a13c3e6b213f3f14d01633d99661c4c8d7e7fd14`，1650 个已跟踪文件 SHA-256 一致。运行环境为 Linux/Python 3.13.15、OpenAI SDK 2.24.0、httpx 0.28.1；native 二进制取自已有 OpenViking 0.4.22.dev95 镜像，并非从该提交重新编译。镜像 digest、分场景计数与阶段断言记录在 `test_scripts/model_retry/native-results.json`。
+2026-09-22 在隔离 K8s Pod 执行 `test_scripts/model_retry/native_e2e.py`，测试 Python 源码为 `a13c3e6b213f3f14d01633d99661c4c8d7e7fd14`，1650 个已跟踪文件 SHA-256 一致。运行环境为 Linux/Python 3.13.15、OpenAI SDK 2.24.0、httpx 0.28.1；native 二进制取自已有 OpenViking 0.4.22.dev95 镜像，并非从该提交重新编译。分场景计数与阶段断言已人工核验；生成的 JSON 输出不纳入版本控制。
 
 实际使用 RAGFS、SQLite QueueFS、filesystem PathLock、本地向量引擎与真实 OpenAI SDK；HTTP 故障由 Pod 内 loopback 模型服务注入，无真实模型费用。初始化的 24 次目录 Embedding 先排空、单独记账，再注入目标操作故障；正常业务扇出与重试明确分开。
 

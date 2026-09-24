@@ -4,6 +4,8 @@ from .base import EventMetricDataSource
 
 
 class ModelRetryEventDataSource(EventMetricDataSource):
+    """Publish normalized retry-owner events to the metrics event bus."""
+
     @classmethod
     def record(cls, event: str, **fields) -> None:
         cls._emit(f"model_retry.{event}", fields)
